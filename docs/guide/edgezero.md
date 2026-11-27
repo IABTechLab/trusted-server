@@ -113,8 +113,10 @@ These rules hold on Fastly, Axum, Cloudflare, and Spin.
   error answers 500 before the response is committed.
 - A response body must finish within 60 s after egress starts.
 - Framework errors, such as a 404, 405, 414, or 431, render as EdgeZero JSON
-  and carry `x-ts-version`. A startup failure response carries no
-  `x-ts-version`.
+  and carry `x-ts-version`. A startup failure answers the fixed response of the
+  [operational response contract](./api-reference#operational-probe-contract),
+  which carries `x-ts-version`. Only EdgeZero's Fastly assembly-error
+  response, for a method outside the publisher fallback set, carries none.
 
 ## Safe operator sequence
 

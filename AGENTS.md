@@ -41,6 +41,7 @@ Supporting files: `edgezero.toml`, `fastly.toml`,
 | Viceroy     | 0.22.0 (from `.tool-versions`)           |
 | Wasmtime    | 48.0.1 (from `.tool-versions`)           |
 | Spin        | 4.1.0 (from `.tool-versions`)            |
+| Wrangler    | 4.83.0 (from `.tool-versions`)           |
 | AWS CLI     | 2.36.45 (from `.tool-versions`)          |
 | Terraform   | 1.16.2 (from `.tool-versions`)           |
 
@@ -381,6 +382,7 @@ Every PR must pass:
 15. Worker auction-deadline runtime fixtures (`worker-auction-deadlines.yml`): build and lint the runtime fixture, then run it under the local runtime. For Cloudflare, `cargo build --locked -p trusted-server-adapter-cloudflare --example deadline-runtime --target wasm32-unknown-unknown --features cloudflare` and `node scripts/test-worker-auction-deadlines.mjs cloudflare --runtime "$(command -v wrangler)"` (requires wrangler and the `Cargo.lock` wasm-bindgen CLI). For Spin, `cargo build --locked -p trusted-server-adapter-spin --example deadline-runtime --target wasm32-wasip1 --features spin` and `node scripts/test-worker-auction-deadlines.mjs spin --runtime "$(command -v spin)"`. CI lints each fixture with the same `cargo clippy` arguments plus `-- -D warnings`
 16. Release producer checks: `node --test scripts/release/phase1.test.mjs && shellcheck scripts/release/phase1-build.sh`
 17. Fastly response diff script: `node --test scripts/fastly-response-diff.test.mjs` with the `.tool-versions` Node
+18. Production health/startup contract (`health-startup-contract.yml`): `./scripts/smoke-fastly.sh`, `./scripts/smoke-axum.sh`, `./scripts/smoke-cloudflare.sh`, and `./scripts/smoke-spin.sh`, using the pinned runtimes from `.tool-versions` and Python 3.11 or newer. These build production artifacts without `test-utils`; any explicit artifact override must point to a fresh build of the tested revision. See `scripts/README.md` for prerequisites and retained diagnostics.
 
 CI also runs these HTML EOF checks. Run them locally only when changing EOF
 finalization, publisher or HTML-processor code:

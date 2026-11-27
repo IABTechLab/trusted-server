@@ -120,19 +120,42 @@ fn make_router() -> RouterService {
         .expect("should build router from test settings")
 }
 
-#[test]
-fn routes_report_missing_worker_config_as_internal_error() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn routes_serve_the_failure_router_without_a_worker_config() {
     // Host targets have no Worker config binding, so startup fails and
-    // `routes()` returns the error EdgeZero answers with.
-    let Err(error) = TrustedServerApp::routes() else {
-        panic!("should fail startup without a Worker config binding");
-    };
+    // `routes()` serves the failure router instead of failing assembly.
+    let router =
+        TrustedServerApp::routes().expect("should serve the failure router when startup fails");
 
-    assert_eq!(
-        error.status(),
-        StatusCode::INTERNAL_SERVER_ERROR,
-        "should map the configuration error to a 500"
-    );
+    for (path, status, body) in [
+        ("/health", StatusCode::OK, "ok"),
+        (
+            "/ready",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable\n",
+        ),
+        (
+            "/",
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Service Unavailable\n",
+        ),
+    ] {
+        let response = route(
+            router.clone(),
+            request_builder()
+                .uri(path)
+                .body(Body::empty())
+                .expect("should build request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), status, "should answer {path}");
+        assert_eq!(
+            response.into_body().into_bytes().as_deref(),
+            Some(body.as_bytes()),
+            "should answer {path} with the fixed body"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

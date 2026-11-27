@@ -47,7 +47,7 @@ impl RuntimeEnvironment for AxumDevServer {
     }
 
     fn health_check_path(&self) -> &str {
-        "/health"
+        "/ready"
     }
 }
 
@@ -89,7 +89,7 @@ impl AxumDevServer {
             child,
             _workspace: workspace,
         };
-        wait_for_health(&base_url, &mut handle.child)?;
+        wait_for_readiness(&base_url, self.health_check_path(), &mut handle.child)?;
         Ok(RuntimeProcess {
             inner: Box::new(handle),
             base_url,
@@ -140,7 +140,12 @@ impl AxumDevServer {
     }
 }
 
-fn wait_for_health(base_url: &str, child: &mut Child) -> TestResult<()> {
+/// Polls the readiness probe at `ready_path` until it answers `200 ready`.
+///
+/// Liveness stays `200` after a caught startup failure, so only readiness
+/// shows that the application router is installed. Fails early when the
+/// process exits.
+fn wait_for_readiness(base_url: &str, ready_path: &str, child: &mut Child) -> TestResult<()> {
     let client = reqwest::blocking::Client::builder()
         .no_proxy()
         .timeout(Duration::from_millis(300))
@@ -155,19 +160,22 @@ fn wait_for_health(base_url: &str, child: &mut Child) -> TestResult<()> {
             return Err(Report::new(TestError::RuntimeNotReady)
                 .attach(format!("Axum exited before readiness: {status}")));
         }
-        if let Ok(response) = client.get(format!("{base_url}/health")).send()
+        if let Ok(response) = client.get(format!("{base_url}{ready_path}")).send()
             && response.status().as_u16() == 200
-            && response.text().is_ok_and(|body| body == "ok")
+            && response.text().is_ok_and(|body| body == "ready")
         {
             return Ok(());
         }
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(Report::new(TestError::RuntimeNotReady).attach(format!(
-        "Axum at {base_url} did not return HTTP 200 /health body ok within 15s"
+        "Axum at {base_url} did not return HTTP 200 {ready_path} body ready within 15s"
     )))
 }
 
+/// Process handle for a running Axum dev-server instance.
+///
+/// Implements [`Drop`] to ensure the process is killed on test cleanup.
 struct AxumHandle {
     child: Child,
     _workspace: tempfile::TempDir,

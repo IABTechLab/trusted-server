@@ -55,6 +55,7 @@ pub(crate) mod edge_cookie;
 pub mod error;
 pub mod forwarder;
 pub mod geo;
+pub mod health;
 pub mod host_header;
 pub(crate) mod host_rewrite;
 pub mod html_processor;

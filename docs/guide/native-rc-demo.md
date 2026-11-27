@@ -21,14 +21,22 @@ flowchart TD
     D --> E[Install immutable snapshots and application router]
     E --> F[Listen]
     B --> X[Fail before listening]
-    C --> X
-    D --> X
+    C --> Y[Install the failure router]
+    D --> Y
+    E --> Y
+    Y --> F
     F --> G[Stop admission and drain on shutdown]
 ```
 
 The declared identities are `trusted_server_config` and
 `trusted_server_secrets`. The configuration key is `trusted_server_config`.
-Required-provider and required-value failures prevent readiness. Startup bounds
+Required-provider and required-value failures prevent readiness. A provider
+preparation failure stops the process before it listens. A failure to read or
+verify the envelope, load a required secret, validate the runtime settings or
+build the application router installs the failure router instead: the process
+listens, `/health` stays `200`, and `/ready` and every supported route answer
+`503` under the
+[operational probe contract](./api-reference#operational-probe-contract). Startup bounds
 envelope bytes, JSON structure, individual secret bytes, total backend bytes and
 extraction time. Only deduplicated active secret references are loaded. Running
 snapshots are immutable. Restart to adopt changed configuration or secrets.

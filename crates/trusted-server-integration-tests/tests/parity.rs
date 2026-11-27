@@ -1921,6 +1921,59 @@ mod trace_parity {
     }
 
     #[tokio::test]
+    async fn operational_probes_do_not_poll_runtime_services() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (adapters, outbound) = routers(true, None, Arc::clone(&calls));
+        for (adapter, router) in adapters {
+            let before = calls.load(Ordering::SeqCst);
+            for method in ["GET", "HEAD"] {
+                for path in ["/health", "/ready"] {
+                    let response = RouterService::oneshot(
+                        &router,
+                        request_builder()
+                            .method(method)
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build operational request"),
+                    )
+                    .await
+                    .expect("should serve operational request");
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "{adapter} should stay ready with unusable request-time services"
+                    );
+                }
+            }
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before,
+                "{adapter} probes should skip geo and other forbidden services"
+            );
+            outbound.assert_no_requests();
+            let response = RouterService::oneshot(
+                &router,
+                request_builder()
+                    .uri("/_ts/trace")
+                    .body(edgezero_core::body::Body::empty())
+                    .expect("should build service control"),
+            )
+            .await
+            .expect("should serve trace control");
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "should serve the positive wiring control"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                before + 1,
+                "should prove injected services reached the adapter"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn trace_dispatch_parity_missing_client_ip_skips_geo() {
         let calls = Arc::new(AtomicUsize::new(0));
         let (adapters, outbound) = routers_with_client(true, None, Arc::clone(&calls), None);
@@ -2750,5 +2803,95 @@ mod trace_parity {
 
     fn futures_trace_empty_stream() -> impl futures::Stream<Item = Result<Bytes, std::io::Error>> {
         futures::stream::iter([Ok(Bytes::new()), Ok(Bytes::new())])
+    }
+}
+
+#[tokio::test]
+async fn operational_probes_bypass_auth_and_response_overrides() {
+    let mut value = serde_json::to_value(test_settings()).expect("should serialize settings");
+    value["handlers"][0]["path"] = serde_json::json!("^/");
+    let mut settings =
+        Settings::from_json_value(value).expect("should build catch-all auth settings");
+    for (name, value) in [
+        ("Cache-Control", "public, max-age=3600"),
+        ("Content-Type", "application/json"),
+        ("Set-Cookie", "fictional=value"),
+        ("WWW-Authenticate", "Basic realm=fictional"),
+    ] {
+        settings
+            .response_headers
+            .insert(name.to_string(), value.to_string());
+    }
+    for router in [
+        AxumApp::routes_with_settings(settings.clone()).expect("should build Axum router"),
+        CloudflareApp::routes_with_settings(settings.clone()).expect("should build Worker router"),
+        SpinApp::routes_with_settings(settings.clone()).expect("should build Spin router"),
+    ] {
+        for method in ["GET", "HEAD"] {
+            for (path, expected) in [("/health?probe=1", "ok"), ("/ready?probe=1", "ready")] {
+                let response = router
+                    .clone()
+                    .oneshot(
+                        request_builder()
+                            .method(method)
+                            .uri(path)
+                            .body(edgezero_core::body::Body::empty())
+                            .expect("should build probe request"),
+                    )
+                    .await
+                    .expect("should serve probe");
+                assert_eq!(
+                    response.status().as_u16(),
+                    200,
+                    "should serve anonymous {method} {path}"
+                );
+                assert_eq!(
+                    response.headers()["cache-control"],
+                    "no-store",
+                    "should prevent probe caching"
+                );
+                assert_eq!(
+                    response.headers()["content-type"],
+                    "text/plain",
+                    "should preserve probe content type"
+                );
+                for header in ["set-cookie", "www-authenticate"] {
+                    assert!(
+                        !response.headers().contains_key(header),
+                        "should omit {header}"
+                    );
+                }
+                let body = response
+                    .into_body()
+                    .into_bytes()
+                    .expect("should read probe body");
+                assert_eq!(
+                    body.as_ref(),
+                    if method == "HEAD" {
+                        b""
+                    } else {
+                        expected.as_bytes()
+                    },
+                    "should serve exact probe bytes"
+                );
+            }
+        }
+        for path in ["/protected", "/health/", "/ready/", "/health/nested"] {
+            let response = router
+                .clone()
+                .oneshot(
+                    request_builder()
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should build protected request"),
+                )
+                .await
+                .expect("should serve protected route");
+            assert_eq!(
+                response.status().as_u16(),
+                401,
+                "should preserve ordinary authentication on {path}"
+            );
+        }
     }
 }

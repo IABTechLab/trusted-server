@@ -206,9 +206,11 @@ impl Running {
                 "should not exit before readiness: {}",
                 self.log()
             );
-            if let Ok(response) = client.get(format!("{}/health", self.base_url())).send()
+            // Liveness stays up after a caught initialization failure, so only
+            // readiness shows that the application router is installed.
+            if let Ok(response) = client.get(format!("{}/ready", self.base_url())).send()
                 && response.status().as_u16() == 200
-                && response.text().is_ok_and(|body| body == "ok")
+                && response.text().is_ok_and(|body| body == "ready")
             {
                 return;
             }
@@ -216,9 +218,68 @@ impl Running {
         }
         assert!(
             Instant::now() < deadline,
-            "should reach exact HTTP 200 health body ok: {}",
+            "should reach exact HTTP 200 ready body ready: {}",
             self.log()
         );
+    }
+
+    /// Asserts that a caught initialization failure serves the failure
+    /// router: liveness stays `200`, while readiness and the publisher page
+    /// answer the fixed `503`.
+    fn unavailable(&mut self, diagnostic: &str) {
+        let client = client();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                self.child
+                    .try_wait()
+                    .expect("should poll child exit")
+                    .is_none(),
+                "should keep serving after an initialization failure: {}",
+                self.log()
+            );
+            if let Ok(response) = client.get(format!("{}/health", self.base_url())).send()
+                && response.status().as_u16() == 200
+                && response.text().is_ok_and(|body| body == "ok")
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "should keep liveness up after an initialization failure: {}",
+                self.log()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        for path in ["/ready", "/"] {
+            let response = client
+                .get(format!("{}{path}", self.base_url()))
+                .send()
+                .expect("should answer from the failure router");
+            assert_eq!(
+                response.status().as_u16(),
+                503,
+                "should answer {path} with the fixed unavailable status"
+            );
+            assert_eq!(
+                response.text().expect("should read the unavailable body"),
+                "Service Unavailable\n",
+                "should answer {path} with the fixed unavailable body"
+            );
+        }
+        let log = self.log();
+        assert!(
+            log.contains(diagnostic),
+            "should report {diagnostic}: {log}"
+        );
+        for secret in [
+            ADMIN_PASSWORD,
+            PROXY_SECRET,
+            EC_PASSPHRASE,
+            FORWARDER_SECRET,
+        ] {
+            assert!(!log.contains(secret), "should not log secret values");
+        }
     }
 
     fn rejected(&mut self, diagnostic: &str) {
@@ -426,13 +487,16 @@ fn prepared_envelope_serves_real_health_tsjs_and_rewritten_page() {
 }
 
 #[test]
-fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
+fn missing_prepared_store_exits_and_invalid_inputs_serve_the_failure_router() {
     let origin = origin::Origin::start("unused");
     let fixture = Prepared::new(&origin.base_url);
+    // Store preparation runs before the initializer, so it still stops startup.
     fs::remove_file(fixture.config_path()).expect("should remove required config snapshot");
     fixture.spawn(false).rejected("required snapshot missing");
     fs::write(fixture.config_path(), "{}").expect("should publish empty config map");
-    fixture.spawn(false).rejected("config envelope is missing");
+    fixture
+        .spawn(false)
+        .unavailable("config envelope is missing");
     fixture.publish();
     for key in [
         "native_admin",
@@ -444,21 +508,21 @@ fn missing_prepared_inputs_and_invalid_runtime_config_exit_before_listen() {
         incomplete.secrets.remove(key);
         incomplete
             .spawn(false)
-            .rejected("a required app-config secret is missing");
+            .unavailable("a required app-config secret is missing");
     }
     let mut invalid = Prepared::new(&origin.base_url);
     invalid.data["publisher"]["origin_url"] = json!("not-a-valid-url");
     invalid.publish();
     invalid
         .spawn(false)
-        .rejected("Trusted Server initialization failed");
+        .unavailable("Trusted Server initialization failed");
     let mut invalid = Prepared::new(&origin.base_url);
     invalid
         .secrets
         .insert("native_ec".to_owned(), "short".to_owned());
     invalid
         .spawn(false)
-        .rejected("Trusted Server initialization failed");
+        .unavailable("Trusted Server initialization failed");
 }
 
 #[test]

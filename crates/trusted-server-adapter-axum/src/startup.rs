@@ -9,7 +9,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use edgezero_adapter_axum::dev_server::PreparedStores;
 use edgezero_core::app::App;
+use edgezero_core::config_store::ConfigExtractionLimits;
 use edgezero_core::error::EdgeError;
+use edgezero_core::router::RouterService;
 use error_stack::Report;
 use trusted_server_core::config_payload::{
     DEFAULT_CONFIG_STORE_ID, DEFAULT_SECRET_STORE_ID, VerifiedConfigBlob,
@@ -20,7 +22,7 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::settings::Settings;
 
-use crate::app::TrustedServerApp;
+use crate::app::{TrustedServerApp, startup_error_router};
 
 /// Immutable inputs shared by per-request native runtime services.
 ///
@@ -172,13 +174,45 @@ fn validate_snapshot_consumers(settings: &Settings) -> Result<(), EdgeError> {
 /// Load and validate the finite native inputs before the framework listens.
 ///
 /// The framework retains ownership of the App, clock, policies, listener,
-/// readiness, and signal/drain lifecycle. Selected-provider failures are fatal.
+/// readiness, and signal/drain lifecycle. Selected-provider preparation, which
+/// the framework runs before this initializer, still fails startup. A failure
+/// here to read the prepared stores, validate the settings or build the
+/// application state installs the failure router instead, so liveness stays up
+/// while `/ready` and every supported route answer the fixed unavailable
+/// response.
+///
+/// # Errors
+/// Returns an error when the application's config extraction limits are
+/// invalid.
+pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result<(), EdgeError> {
+    let limits = app.config_extraction_limits().validate()?;
+    match prepare_native(app, stores, limits).await {
+        Ok((router, snapshot)) => {
+            app.set_router(router);
+            app.insert_state(snapshot);
+        }
+        Err(error) => {
+            // The framework no longer sees this failure, so this safe
+            // application diagnostic is the only one that tells operators
+            // which input to fix.
+            log::error!("Trusted Server initialization failed: {error}");
+            app.set_router(startup_error_router(&error));
+        }
+    }
+    Ok(())
+}
+
+/// Reads the prepared stores and builds the application router and the
+/// store snapshot it serves from.
 ///
 /// # Errors
 /// Returns an error for missing bindings/values, bounded-read failures, invalid
 /// envelopes or runtime settings, unsupported store consumers, or invalid plans.
-pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result<(), EdgeError> {
-    let limits = app.config_extraction_limits().validate()?;
+async fn prepare_native(
+    app: &App,
+    stores: &PreparedStores,
+    limits: ConfigExtractionLimits,
+) -> Result<(RouterService, Arc<NativeStoreSnapshot>), EdgeError> {
     let clock = app.monotonic_clock();
     let deadline = clock.deadline_after(limits.timeout);
     let binding = stores
@@ -266,9 +300,7 @@ pub async fn initialize_native(app: &mut App, stores: &PreparedStores) -> Result
         }),
         secret_store,
     });
-    app.set_router(router);
-    app.insert_state(snapshot);
-    Ok(())
+    Ok((router, snapshot))
 }
 
 #[cfg(test)]
@@ -414,12 +446,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_prepared_stores_fail_initialization() {
+    async fn missing_prepared_stores_serve_the_failure_router() {
         let mut app = App::build::<TrustedServerApp>(AXUM_PLATFORM)
             .expect("should assemble the empty pre-initialization router");
-        let error = initialize_native(&mut app, &PreparedStores::default())
+        let limits = app
+            .config_extraction_limits()
+            .validate()
+            .expect("should accept the default extraction limits");
+        let Err(error) = prepare_native(&app, &PreparedStores::default(), limits).await else {
+            panic!("should reject absent prepared stores");
+        };
+        assert!(
+            error.to_string().contains("not prepared"),
+            "should name the unprepared store: {error}"
+        );
+
+        initialize_native(&mut app, &PreparedStores::default())
             .await
-            .expect_err("should reject absent prepared stores");
-        assert!(error.to_string().contains("not prepared"));
+            .expect("should install the failure router instead of failing startup");
+
+        for (path, status) in [("/health", 200), ("/ready", 503), ("/", 503)] {
+            let response = app
+                .router()
+                .clone()
+                .oneshot(
+                    edgezero_core::http::request_builder()
+                        .method("GET")
+                        .uri(path)
+                        .body(edgezero_core::body::Body::empty())
+                        .expect("should construct startup request"),
+                )
+                .await
+                .expect("should serve the failure router");
+            assert_eq!(
+                response.status().as_u16(),
+                status,
+                "should answer {path} from the failure router"
+            );
+        }
     }
 }

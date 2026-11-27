@@ -1,5 +1,7 @@
 # Repository scripts
 
+The four `smoke-*.sh` adapter scripts require Python 3.11 or newer; the Fastly fixture reads TOML with `tomllib`.
+
 Run these scripts from the repository root. They fail on command errors unless
 their documented orchestration handles a probe deliberately.
 
@@ -12,7 +14,7 @@ their documented orchestration handles a probe deliberately.
 | `generate-integration-viceroy-configs.sh` | Rust toolchain; optional origin port, artifact directory, bidder origin                     | Builds the native generator and writes Viceroy config under `target/integration-test-artifacts/`; generated files persist. With `INTEGRATION_BIDDER_ORIGIN_URL` set, the generator replaces the scheme and authority of every `auction.providers.*.endpoint` with that origin.                                                                                 |
 | `integration-tests.sh`                    | Docker, Viceroy, Rust WASM target, pinned Node; Spin CLI only for a named Spin runtime case | Builds WASM/native artifacts and two Docker images, generates Viceroy config, and runs native integration tests serially. Skips the trace probes and the Spin runtime cases, as CI's main job does, unless a test filter names one; naming a Spin runtime case also builds the production Spin component. Build products and images persist.                   |
 | `integration-tests-browser.sh`            | The integration prerequisites plus npm and Playwright                                       | Installs package/browser dependencies, builds fixtures and images, runs both browser suites, and stops matching test containers on exit. Build and npm artifacts persist.                                                                                                                                                                                      |
-| `smoke-axum.sh`                           | `cargo`, `curl`, `jq`, Python, and `pgrep`                                                  | Uses an isolated temporary config/store and stub origin. Each negative case must stop Axum at startup with a non-zero exit and log its diagnostic. Stops owned processes and removes its workspace.                                                                                                                                                            |
+| `smoke-axum.sh`                           | `cargo`, `curl`, `jq`, Python, and `pgrep`                                                  | Uses an isolated temporary config/store and stub origin. Each negative case must keep `/health` live while `/ready` and the publisher route answer 503, and log its diagnostic. Stops owned processes and removes its workspace.                                                                                                                               |
 | `smoke-fastly.sh`                         | Fastly CLI, `cargo`, `curl`, Python, and `pgrep`                                            | Uses an isolated Fastly project and application config; stops owned processes and removes its workspace.                                                                                                                                                                                                                                                       |
 | `smoke-cloudflare.sh`                     | Pinned Wrangler, `cargo`, `curl`, `jq`, Python, and `pgrep`                                 | Uses isolated Wrangler manifests, KV state, ports, and logs; stops owned processes and removes its workspace.                                                                                                                                                                                                                                                  |
 | `smoke-spin.sh`                           | Spin CLI, `cargo`, `curl`, Python, and `pgrep`                                              | Uses an isolated Spin manifest and SQLite KV store; stops owned processes and removes its workspace.                                                                                                                                                                                                                                                           |
@@ -26,6 +28,37 @@ their documented orchestration handles a probe deliberately.
 | `docs-proposal/validate.sh`               | Merge SHA, work dir from `propose.sh`; Node, `npm`; no write credentials                    | Applies the patch, rejects paths outside the allowlist, and runs the docs gates. Leaves the edits staged.                                                                                                                                                                                                                                                      |
 | `docs-proposal/publish.sh`                | Merge SHA, work dir from `propose.sh`; `gh` with write `GH_TOKEN`                           | Re-checks the allowlist without building, pushes `docs/auto/<sha12>` (`docs/auto/<branch-hash12>/<sha12>` off `main`) unless a maintainer added to it, opens or edits its PR, and reviews each new commit per hunk. An empty rerun deletes the branch under a lease, then closes the PR; a failed branch lookup stops the run. Never writes the target branch. |
 | `docs-proposal/test.sh`                   | Git, Node, and `jq`                                                                         | Tests the helpers and the propose, validate, and publish flows against a temporary repository with stubbed `copilot`, `gh`, and `npm`; removes it on exit.                                                                                                                                                                                                     |
+
+## Health and startup smoke checks
+
+Run `./scripts/smoke-axum.sh`, `./scripts/smoke-fastly.sh`,
+`./scripts/smoke-cloudflare.sh`, or `./scripts/smoke-spin.sh` with current
+production artifacts and the pinned runtime tools. The health/startup CI matrix
+runs each adapter separately. See the canonical
+[operational response contract](../docs/guide/api-reference.md#operational-probe-contract).
+
+Positive application-start waits require `/ready` to return 200. Negative
+startup fixtures wait for liveness or transport, then require `/health` to stay
+200 and `/ready` plus ordinary publisher requests to return a generic 503.
+The smoke checks exact GET bodies, empty HEAD bodies, fixed content types,
+`Cache-Control: no-store`, and no cookie or authentication challenge headers.
+Missing config, each required secret, a malformed envelope, and valid-envelope
+invalid settings are separate controlled startup failures. Detailed diagnostics
+belong in logs; public failures contain only `Service Unavailable\n`. The
+malformed-envelope case injects a literal `{` at the runtime config boundary.
+The invalid-settings case sets `publisher.domain` to the empty string and
+reconstructs a valid-integrity envelope, separating settings validation from
+envelope parsing.
+
+Probes bypass catch-all authentication and configured response headers and do
+not forward to the origin. An ordinary protected route must still challenge,
+and the final publisher request must return the controlled origin sentinel and
+expected URL rewrite. A green probe cannot replace that publisher control.
+
+Set `SMOKE_ARTIFACT_DIR` to preserve synthetic fixture logs and HTTP response
+captures before temporary-workspace cleanup. Config envelopes, secret fixture
+files, and ambient environment files are excluded; default cleanup still runs.
+The health/startup CI workflow uploads these captures on failure.
 
 ## HTML EOF runtime checks
 

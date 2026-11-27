@@ -149,7 +149,7 @@ export async function startViceroy(
     });
 
     try {
-      await waitForReady(baseUrl, "/health");
+      await waitForReady(baseUrl, "/ready");
     } catch (err) {
       // Viceroy spawned but never became ready, kill it before propagating.
       if (child.pid) await stopViceroy(child.pid);
