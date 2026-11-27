@@ -70,8 +70,35 @@ pub struct ConsentedProvidersSettings {
 pub struct Eid {
     /// Identity provider domain (e.g. `"id5-sync.com"`).
     pub source: String,
+    /// `OpenRTB` `inserter`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inserter: Option<String>,
+    /// `OpenRTB` `matcher`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub matcher: Option<String>,
+    /// `OpenRTB` `mm` (match method).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mm: Option<i32>,
+    /// EID-level extension data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<Value>,
     /// One or more user IDs from this provider.
     pub uids: Vec<Uid>,
+}
+
+impl Eid {
+    /// Builds an entry with no EID-level fields.
+    #[must_use]
+    pub fn new(source: impl Into<String>, uids: Vec<Uid>) -> Self {
+        Self {
+            source: source.into(),
+            inserter: None,
+            matcher: None,
+            mm: None,
+            ext: None,
+            uids,
+        }
+    }
 }
 
 /// A single user identifier within an [`Eid`] entry.
@@ -406,15 +433,45 @@ mod tests {
     }
 
     #[test]
+    fn eid_serializes_eid_level_fields_only_when_present() {
+        let plain = Eid::new("ids.example.com", vec![]);
+        assert_eq!(
+            serde_json::to_value(&plain).expect("should serialize"),
+            serde_json::json!({ "source": "ids.example.com", "uids": [] }),
+            "should omit absent EID-level fields"
+        );
+        let full = Eid {
+            inserter: Some("inserter.example.com".to_owned()),
+            matcher: Some("matcher.example.com".to_owned()),
+            mm: Some(3),
+            ext: Some(serde_json::json!({ "k": 1 })),
+            ..Eid::new("ids.example.com", vec![])
+        };
+        let value = serde_json::to_value(&full).expect("should serialize");
+        assert_eq!(
+            value["inserter"],
+            serde_json::json!("inserter.example.com"),
+            "should write inserter"
+        );
+        assert_eq!(value["mm"], serde_json::json!(3), "should write mm");
+        let back: Eid = serde_json::from_value(value).expect("should accept EID-level fields");
+        assert_eq!(
+            back.matcher.as_deref(),
+            Some("matcher.example.com"),
+            "should read matcher"
+        );
+    }
+
+    #[test]
     fn eid_serializes_correctly() {
-        let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+        let eid = Eid::new(
+            "id5-sync.com".to_owned(),
+            vec![Uid {
                 id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
         assert_eq!(serialized["source"], "id5-sync.com", "source should match");
@@ -431,14 +488,14 @@ mod tests {
 
     #[test]
     fn eid_serializes_vendor_specific_atype() {
-        let eid = Eid {
-            source: "google.com".to_owned(),
-            uids: vec![Uid {
+        let eid = Eid::new(
+            "google.com".to_owned(),
+            vec![Uid {
                 id: "pair-id".to_owned(),
                 atype: Some(571187),
                 ext: None,
             }],
-        };
+        );
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
 
