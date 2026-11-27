@@ -372,7 +372,8 @@ async fn dispatch_ec_route(
             &mut response,
         )
         .await;
-    state.identity.schedule_after_response(
+    // Registration failures are logged inside; the response is sent either way.
+    let _registered = state.identity.schedule_after_response(
         ec.context,
         after_response,
         scheduler,
