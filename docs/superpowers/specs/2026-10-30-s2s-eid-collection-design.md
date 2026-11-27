@@ -1742,7 +1742,9 @@ PR A changes behaviour that operators and integrators can observe:
   Metadata get no EC, and integration proxies no longer mint one.
 - **`user.id` withheld.** An EC minted on the current navigation is not sent
   as `user.id`, and that navigation's auction carries no browser `ts-eids`,
-  until a later navigation finds its row.
+  until a later navigation finds its row. With an EC KV store, an EC goes to
+  bidders as `user.id` only when the request read a consented row for it
+  (#1549); without one (Axum, Cloudflare, Spin) the consented EC is still sent.
 - **Browser EIDs.** `/auction` no longer stores its body EIDs, and neither
   `/auction` nor page-bids writes `ts-eids` or `sharedId`; the next navigation
   ingests those cookies.
