@@ -342,6 +342,8 @@ pub struct EcContext {
     mirror_cookie: Option<String>,
     /// Allowed returning-user EID persistence source, assigned only after request filters pass.
     eid_sync_source: Option<EidSyncSource>,
+    /// Existing publisher document authorization, confirmed before finalization.
+    sliding_document: bool,
     /// Navigation permit issued by the router for page-load navigations.
     navigation_permit: PermitSlot,
     /// Permit for the navigation's follow-up write after its response, set
@@ -437,6 +439,7 @@ impl EcContext {
             pull_marker_present: parsed.pull_marker_present,
             mirror_cookie: parsed.mirror_cookie,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -811,6 +814,7 @@ impl EcContext {
             pull_marker_present: false,
             mirror_cookie: None,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -842,6 +846,7 @@ impl EcContext {
             pull_marker_present: false,
             mirror_cookie: None,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),
@@ -876,6 +881,7 @@ impl EcContext {
             pull_marker_present: false,
             mirror_cookie: None,
             eid_sync_source: None,
+            sliding_document: false,
             navigation_permit: PermitSlot::default(),
             after_response_permit: AfterResponsePermitSlot::default(),
             lookup_results: LookupResults::default(),

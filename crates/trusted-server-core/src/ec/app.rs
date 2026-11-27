@@ -20,6 +20,8 @@ mod lifecycle;
 mod route;
 #[cfg(test)]
 mod route_tests;
+#[cfg(test)]
+mod sliding_tests;
 pub use lifecycle::IdentityRequest;
 pub use route::EC_PATH;
 

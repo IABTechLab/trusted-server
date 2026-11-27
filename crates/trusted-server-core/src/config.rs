@@ -889,6 +889,37 @@ mod tests {
     use edgezero_core::app_config::AppConfigMeta;
     use edgezero_core::blob_envelope::BlobEnvelope;
 
+    #[test]
+    fn typed_config_checks_ec_cookie_lifetime() {
+        for days in [1, 30, 365, 400] {
+            let toml =
+                crate_test_settings_str().replace("[ec]", &format!("[ec]\nmax_age_days = {days}"));
+            let mut config: TrustedServerAppConfig =
+                toml::from_str(&toml).expect("should decode valid lifetime for config push");
+            config.settings.proxy.allowed_domains = valid_settings().proxy.allowed_domains;
+            TrustedServerAppConfig::new(config.into_settings())
+                .expect("should validate lifetime for config push");
+        }
+        let settings =
+            Settings::from_toml(&crate_test_settings_str()).expect("should parse settings");
+        for invalid in [
+            serde_json::json!(0),
+            serde_json::json!(401),
+            serde_json::json!("30"),
+            serde_json::json!(1.5),
+            serde_json::json!(true),
+        ] {
+            let mut value = serde_json::to_value(&settings).expect("should serialize settings");
+            value["ec"]["max_age_days"] = invalid;
+            let error = serde_json::from_value::<TrustedServerAppConfig>(value)
+                .expect_err("should reject invalid lifetime before config push");
+            assert!(
+                error.to_string().contains("ec.max_age_days"),
+                "should identify lifetime field: {error}"
+            );
+        }
+    }
+
     #[derive(Debug, Deserialize)]
     #[serde(deny_unknown_fields)]
     #[allow(dead_code)]

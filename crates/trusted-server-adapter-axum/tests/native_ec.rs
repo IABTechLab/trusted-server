@@ -28,6 +28,9 @@ use trusted_server_core::platform::{
 };
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction::{self, NextJsAuctionOrigin};
+use trusted_server_core::test_support::scripted_client::{
+    ScriptedHttpClient, ScriptedReply, TestClock,
+};
 
 #[cfg(feature = "celld-ec")]
 #[path = "support/celld.rs"]
@@ -977,4 +980,99 @@ async fn ec_withdrawal_storage_failure_is_not_acknowledged_as_success() {
         row["consent"]["ok"], true,
         "should prove the failed store left a live authoritative row"
     );
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn sliding_ec_renews_only_the_held_identity_on_publisher_documents_without_storage() {
+    let identity = format!("{}.test01", "a".repeat(64));
+    let cookie = format!("ts-ec={identity}");
+    for sliding in [false, true] {
+        let mut configured = serde_json::to_value(settings()).expect("should serialize settings");
+        configured["ec"]["sliding_refresh"] = json!(sliding);
+        configured["ec"]["max_age_days"] = json!(30);
+        configured["ec"]["ec_store"] = serde_json::Value::Null;
+        configured["ec"]["storage"] = serde_json::Value::Null;
+        let settings: Settings = serde_json::from_value(configured)
+            .expect("should configure sliding EC without storage");
+        let clock = TestClock::new();
+        let origin = ScriptedHttpClient::new(&clock);
+        for (path, content_type) in [("/article", "text/html"), ("/asset.css", "text/css")] {
+            origin.respond_to(
+                Method::GET,
+                &format!("{}{path}", settings.publisher.origin_url),
+                ScriptedReply::status(axum::http::StatusCode::OK)
+                    .header("content-type", content_type)
+                    .header("cache-control", "public, max-age=600")
+                    .body("<html><head></head><body>Example article</body></html>"),
+            );
+        }
+        let services = RuntimeServices::builder()
+            .config_store(Arc::new(UnusedStores))
+            .secret_store(Arc::new(UnusedStores))
+            .kv_store(Arc::new(UnavailableKvStore))
+            .outbound_client(origin.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(Geo(Some(GeoInfo::country_region("AU", None)))))
+            .client_info(ClientInfo {
+                client_ip: Some("198.51.100.42".parse().expect("should parse fixture IP")),
+                ..ClientInfo::default()
+            })
+            .build();
+        let app = TrustedServerApp::routes_with_settings_and_services(settings, services)
+            .expect("should construct router without identity storage");
+        let page = call(&app, request(Method::GET, "/article", Some(&cookie))).await;
+        assert_eq!(
+            page.status(),
+            200,
+            "should serve the actual publisher document"
+        );
+        assert_eq!(
+            ec_cookie(&page).as_deref(),
+            sliding.then_some(identity.as_str()),
+            "should renew the same held identity only when enabled"
+        );
+        if sliding {
+            let emitted: Vec<_> = page.headers().get_all(header::SET_COOKIE).iter().collect();
+            assert_eq!(emitted.len(), 1, "should emit exactly one EC renewal");
+            assert_eq!(
+                emitted[0].to_str().expect("should encode cookie"),
+                format!(
+                    "ts-ec={identity}; Domain=.test-publisher.example.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000; HttpOnly"
+                ),
+                "should use the full configured duration and preserve attributes"
+            );
+            assert_eq!(
+                page.headers()[header::CACHE_CONTROL],
+                "private, max-age=0",
+                "should apply cookie privacy after late EC finalization"
+            );
+        }
+        for (method, path) in [
+            (Method::GET, "/asset.css"),
+            (Method::GET, "/_ts/api/v1/ec"),
+            (Method::POST, "/_ts/api/v1/ec"),
+            (Method::GET, "/health"),
+            (Method::POST, "/_ts/api/v1/identify"),
+        ] {
+            let mut req = request(method, path, Some(&cookie));
+            if path.ends_with(".css") {
+                req.headers_mut().insert(
+                    "sec-fetch-dest",
+                    "style".parse().expect("should mark asset request"),
+                );
+            }
+            let response = call(&app, req).await;
+            if path == "/_ts/api/v1/ec" {
+                assert_eq!(
+                    response.status(),
+                    501,
+                    "should preserve unsupported EC route"
+                );
+            }
+            assert!(
+                !response.headers().contains_key(header::SET_COOKIE),
+                "should not renew on {path}, enabled={sliding}"
+            );
+        }
+    }
 }

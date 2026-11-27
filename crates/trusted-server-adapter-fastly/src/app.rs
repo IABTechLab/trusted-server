@@ -5858,6 +5858,120 @@ mod tests {
     }
 
     #[test]
+    fn sliding_ec_renews_held_publisher_identity_before_terminal_privacy() {
+        let identity = format!("{}.test01", "a".repeat(64));
+        for sliding in [false, true] {
+            let mut settings = test_settings();
+            settings.auction.enabled = false;
+            settings.auction.providers.clear();
+            settings.creative_opportunities = None;
+            let mut configured =
+                serde_json::to_value(settings).expect("should serialize Fastly route settings");
+            configured["ec"]["sliding_refresh"] = serde_json::json!(sliding);
+            configured["ec"]["max_age_days"] = serde_json::json!(30);
+            configured["ec"]["ec_store"] = serde_json::Value::Null;
+            configured["ec"]["storage"] = serde_json::Value::Null;
+            let settings: Settings = serde_json::from_value(configured)
+                .expect("should configure sliding EC without storage");
+            let state = app_state_for_settings(settings);
+            let router = TrustedServerApp::routes_for_state(&state);
+            let clock = TestClock::new();
+            let origin = ScriptedHttpClient::new(&clock);
+            for (path, mime) in [("/article", "text/html"), ("/asset.css", "text/css")] {
+                origin.respond_to(
+                    Method::GET,
+                    &format!("{}{path}", state.settings.publisher.origin_url),
+                    ScriptedReply::status(StatusCode::OK)
+                        .header("content-type", mime)
+                        .header("cache-control", "public, max-age=600")
+                        .header("surrogate-control", "max-age=600")
+                        .body("<html><head></head><body>Example article</body></html>"),
+                );
+            }
+            for (method, path, document) in [
+                (Method::GET, "/article", true),
+                (Method::GET, "/asset.css", false),
+                (Method::GET, "/_ts/api/v1/ec", true),
+                (Method::POST, "/_ts/api/v1/ec", true),
+                (Method::GET, "/health", false),
+                (Method::POST, "/_ts/api/v1/identify", false),
+            ] {
+                let mut request =
+                    browser_request(method, path, if document { "document" } else { "empty" });
+                request.extensions_mut().insert(ClientInfo {
+                    client_ip: Some(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+                    ..ClientInfo::default()
+                });
+                request.headers_mut().insert(
+                    header::COOKIE,
+                    HeaderValue::from_str(&format!("us_privacy=1YNN; ts-ec={identity}"))
+                        .expect("should encode held identity"),
+                );
+                let mut response = route_with_host_geo(&router, request, &origin);
+                if let Some(mut ec_state) =
+                    response.extensions_mut().remove::<super::EcFinalizeState>()
+                {
+                    clock.drive(crate::apply_edgezero_ec_finalize(
+                        &state,
+                        &mut ec_state,
+                        &mut response,
+                    ));
+                } else {
+                    // The liveness probe is an operational response, which
+                    // never carries EC state to finalization.
+                    assert!(
+                        matches!(path, "/_ts/api/v1/ec" | "/health"),
+                        "should skip finalization only for the unsupported EC route and the liveness probe: {path}"
+                    );
+                }
+                // The entry point runs this after identity finalization and late filter effects.
+                crate::apply_terminal_response_effects(&mut response, None);
+                if path == "/_ts/api/v1/ec" {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NOT_IMPLEMENTED,
+                        "should preserve unsupported EC route"
+                    );
+                }
+                let cookies: Vec<_> = response
+                    .headers()
+                    .get_all(header::SET_COOKIE)
+                    .iter()
+                    .collect();
+                if path == "/article" && sliding {
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::OK,
+                        "should serve actual publisher HTML"
+                    );
+                    assert_eq!(cookies.len(), 1, "should issue exactly one renewal");
+                    assert_eq!(
+                        cookies[0].to_str().expect("should encode EC renewal"),
+                        format!(
+                            "ts-ec={identity}; Domain=.test-publisher.com; Path=/; Secure; SameSite=Lax; Max-Age=2592000; HttpOnly"
+                        ),
+                        "should preserve identity and attributes with full configured age"
+                    );
+                    assert_eq!(
+                        response.headers()[header::CACHE_CONTROL],
+                        "private, max-age=0",
+                        "should enforce privacy after the late cookie is added"
+                    );
+                    assert!(
+                        !response.headers().contains_key("surrogate-control"),
+                        "should remove the origin shared cache policy"
+                    );
+                } else {
+                    assert!(
+                        cookies.is_empty(),
+                        "should not renew this response: {path}, enabled={sliding}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn named_route_response_is_not_recovery_eligible() {
         // Orphan recovery must never be authorized on a named route: it is not a
         // publisher-page navigation, so a missing KV row must not rotate the

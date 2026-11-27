@@ -182,7 +182,7 @@ Check response headers:
 - `x-ts-ec-consent`
 - `x-ts-eids`
 
-For returning users, ordinary page views should not refresh `Set-Cookie: ts-ec=...`. A `Set-Cookie` header is expected when the EC is newly generated.
+With the default `ec.sliding_refresh = false`, returning users should receive no renewed `Set-Cookie: ts-ec=...` on ordinary page views. When enabled on Fastly or Axum, an eligible consented document visit renews the same value with the full `ec.max_age_days` lifetime and makes the response private; `/auction` still does not renew it. A newly generated EC also receives `Set-Cookie`. See [Configuration Reference](/guide/configuration#configurable-ec-lifetime-and-sliding-expiration-proposal) for the proposal restrictions and record-state limits.
 
 Decode `x-ts-eids`:
 
