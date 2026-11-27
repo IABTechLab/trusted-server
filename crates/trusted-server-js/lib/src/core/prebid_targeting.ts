@@ -252,22 +252,31 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
         // Native suffixed keys may truncate the bidder suffix differently for
         // each base key. Associate observed suffixes with their native render ID;
         // ambiguous shared prefixes are refused rather than guessed from seats.
-        const identitySuffixes = Object.entries(targeting)
-          .filter(
-            ([key, item]) =>
-              key.startsWith('hb_adid_') &&
-              (Array.isArray(item) ? item.includes(record.adId) : item === record.adId)
-          )
-          .map(([key]) => key.slice('hb_adid_'.length));
+        const identities = Object.entries(targeting)
+          .filter(([key]) => key.startsWith('hb_adid_'))
+          .map(([key, item]) => ({
+            suffix: key.slice('hb_adid_'.length),
+            truncated: key.length === 20,
+            owned: Array.isArray(item) ? item.includes(record.adId) : item === record.adId,
+          }));
         const nativeKeys = Object.keys(record.nativeTargeting);
         return Object.fromEntries(
           Object.entries(targeting).filter(([key, item]) => {
             const ownedSuffix = nativeKeys.some((base) => {
               if (!key.startsWith(`${base}_`)) return false;
               const suffix = key.slice(base.length + 1);
-              return identitySuffixes.some(
-                (identity) => identity.startsWith(suffix) || suffix.startsWith(identity)
-              );
+              const exact = identities.filter((identity) => identity.suffix === suffix);
+              // An exact foreign ID receipt takes precedence over a shared
+              // prefix. Prefix matching is only valid at the pinned native
+              // 20-character boundary already qualified by artifact controls.
+              const matches = exact.length
+                ? exact
+                : identities.filter(
+                    (identity) =>
+                      (key.length === 20 && identity.suffix.startsWith(suffix)) ||
+                      (identity.truncated && suffix.startsWith(identity.suffix))
+                  );
+              return matches.some((identity) => identity.owned);
             });
             const ownedKey = hasOwn(record.nativeTargeting, key) && !record.unitKeys.has(key);
             const renderIdentity = Array.isArray(item)

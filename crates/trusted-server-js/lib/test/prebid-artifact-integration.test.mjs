@@ -1546,13 +1546,18 @@ describe('pinned Prebid public targeting contract', () => {
     }
   });
 
-  it.each([seat, 'exampleLongBidderSeat'])(
-    'removes a refused %s native suffix namespace and preserves another bidder',
-    async (localSeat) => {
+  it.each([
+    [seat, 'exampleClient'],
+    ['exampleLongBidderSeat', 'exampleClient'],
+    ['example', 'exampleClient'],
+    ['exampleClient', 'example'],
+  ])(
+    'removes a refused %s native suffix namespace and preserves %s',
+    async (localSeat, clientCode) => {
       const page = targetingPage({
         config: { enableSendAllBids: true },
         client: { cpm: 0.99 },
-        clientCode: 'exampleClient',
+        clientCode,
         respond: () => {
           const body = serverResponse(price, { hb_pb: '8.88' });
           body.seatbid[0].seat = localSeat;
@@ -1569,15 +1574,16 @@ describe('pinned Prebid public targeting contract', () => {
       try {
         await page.auction();
         const localId = page.bids().find((bid) => bid.adapterCode === 'trustedServer').adId;
-        const clientId = page.bids().find((bid) => bid.bidderCode === 'exampleClient').adId;
+        const clientId = page.bids().find((bid) => bid.bidderCode === clientCode).adId;
         page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
           page.pageWindow.tsjs.navGeneration = 1;
           page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
           return () => true;
         });
-        expect(page.slots[0].values.hb_pb_exampleClient).toEqual(['0.90']);
-        expect(page.slots[0].values.hb_adid_exampleClien).toEqual([clientId]);
         const values = Object.values(page.slots[0].values).flat();
+        expect(values).toContain('0.90');
+        expect(values).toContain(clientId);
+        expect(values).toContain(clientCode);
         expect(values).not.toContain(localId);
         expect(values).not.toContain(localSeat);
         expect(values).not.toContain('1.20');
