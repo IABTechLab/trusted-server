@@ -1256,21 +1256,15 @@ async fn dispatch_fallback(
         // Only for document navigations by recognised browsers; subresource
         // requests may lack consent signals such as Sec-GPC.
         let is_navigation = is_navigation_request(&req);
-        let mut has_permit = false;
         if is_navigation {
             ec.ec_context.set_eid_sync_source(EidSyncSource::Navigation);
-            // The page-load write permit uses the stricter Fetch Metadata test
-            // (spec §3.1); requests without it never write KV.
+            // The navigation's page-load write creates or updates its row.
             if let Some(permit) = NavigationPermit::classify(&req) {
                 ec.ec_context.set_navigation_permit(permit);
-                has_permit = true;
             }
         }
         let is_publisher_navigation = ec.is_real_browser && is_navigation;
-        // A new EC is minted only when this request may also write its row,
-        // so a client without Fetch Metadata never receives a throwaway EC.
         if is_publisher_navigation
-            && has_permit
             && let Err(err) = ec
                 .ec_context
                 .generate_if_needed(&state.settings, ec.kv_graph.as_ref())
@@ -1283,7 +1277,7 @@ async fn dispatch_fallback(
         // the entry point collects them before EC finalization. A hashed-email
         // status call (spec §8.7) precedes them inside that join, so it never
         // delays the origin fetch.
-        let page_identity = if is_publisher_navigation && has_permit {
+        let page_identity = if is_publisher_navigation {
             PageIdentityDispatch::prepare(state, services, &req, &mut ec).await
         } else {
             None
@@ -1291,7 +1285,6 @@ async fn dispatch_fallback(
         // After-response providers only capture request signals here; they
         // are built and dispatched once the response has been sent.
         if is_publisher_navigation
-            && has_permit
             && let Some(lookups) = prepare_after_response_lookups(state, services, &req, &ec)
         {
             NAVIGATION_LOOKUPS.with(|slot| slot.borrow_mut().after_response = Some(lookups));
@@ -3773,7 +3766,7 @@ mod tests {
     }
 
     #[test]
-    fn navigation_without_fetch_metadata_mints_no_ec() {
+    fn navigation_without_fetch_metadata_mints_an_ec_via_the_accept_fallback() {
         let router = test_router();
         let mut request = consented_navigation(empty_request(Method::GET, "/article"));
         request
@@ -3790,8 +3783,8 @@ mod tests {
 
         let state = take_finalize_state(&mut response);
         assert!(
-            state.ec_context.ec_value().is_none(),
-            "should not mint an EC that no row can back"
+            state.ec_context.ec_value().is_some(),
+            "should mint an EC on a navigation recognised by its HTML Accept header"
         );
     }
 
@@ -4324,7 +4317,7 @@ mod tests {
     }
 
     #[test]
-    fn publisher_request_without_fetch_metadata_navigation_gets_no_permit() {
+    fn publisher_document_request_without_sec_fetch_mode_gets_a_permit() {
         let router = test_router();
         let mut prefetch = navigation_request("/article");
         prefetch
@@ -4339,10 +4332,23 @@ mod tests {
 
             let mut state = take_finalize_state(&mut response);
             assert!(
-                state.ec_context.take_navigation_permit_for_test().is_none(),
-                "should not issue a permit without a top-level navigation"
+                state.ec_context.take_navigation_permit_for_test().is_some(),
+                "should issue a permit to any Sec-Fetch-Dest document navigation"
             );
         }
+    }
+
+    #[test]
+    fn publisher_subresource_request_gets_no_permit() {
+        let router = test_router();
+
+        let mut response = route(&router, browser_request(Method::GET, "/article", "image"));
+
+        let mut state = take_finalize_state(&mut response);
+        assert!(
+            state.ec_context.take_navigation_permit_for_test().is_none(),
+            "should not issue a permit to a subresource request"
+        );
     }
 
     #[test]
