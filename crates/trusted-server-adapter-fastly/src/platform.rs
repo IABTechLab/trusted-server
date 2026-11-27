@@ -362,8 +362,8 @@ pub fn client_info_from_request(req: &Request, client_ip: Option<IpAddr>) -> Cli
             .map(str::to_string),
         tls_ja4: req.get_tls_ja4().map(str::to_string),
         h2_fingerprint: req.get_client_h2_fingerprint().map(str::to_string),
-        server_hostname: std::env::var("FASTLY_HOSTNAME").ok(),
-        server_region: std::env::var("FASTLY_REGION").ok(),
+        server_hostname: trusted_server_core::runtime_env!("FASTLY_HOSTNAME").ok(),
+        server_region: trusted_server_core::runtime_env!("FASTLY_REGION").ok(),
     }
 }
 
