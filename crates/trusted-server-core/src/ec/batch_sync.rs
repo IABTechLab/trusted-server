@@ -21,6 +21,7 @@ use http::{Request, Response, StatusCode};
 use serde::{Deserialize, Serialize};
 
 use crate::error::TrustedServerError;
+use crate::http_util::read_request_body;
 
 use super::auth::authenticate_bearer;
 use super::generation::{is_valid_ec_id, normalize_ec_id_for_kv};
@@ -36,6 +37,9 @@ const REASON_KV_UNAVAILABLE: &str = "kv_unavailable";
 
 /// Maximum number of mappings allowed in a single batch request.
 const MAX_BATCH_SIZE: usize = 1000;
+
+/// Maximum request body size accepted before mappings are parsed (2 MB).
+const MAX_BODY_SIZE: usize = 2 * 1024 * 1024;
 
 use super::kv_types::MAX_UID_LENGTH;
 
@@ -108,19 +112,22 @@ struct MappingGroup {
 
 /// Handles `POST /_ts/api/v1/batch-sync`.
 ///
+/// A body over the 2 MB cap is answered with a 413 `body_too_large` response.
+///
 /// # Errors
 ///
-/// Returns [`TrustedServerError`] on serialization or KV store failures.
-pub fn handle_batch_sync(
+/// Returns [`TrustedServerError`] on serialization or KV store failures, and
+/// the [`read_request_body`] error when the body read times out or fails.
+pub async fn handle_batch_sync(
     kv: &KvIdentityGraph,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
-    handle_batch_sync_with_writer(kv, registry, rate_limiter, req)
+    handle_batch_sync_with_writer(kv, registry, rate_limiter, req).await
 }
 
-fn handle_batch_sync_with_writer(
+async fn handle_batch_sync_with_writer(
     writer: &dyn BatchSyncWriter,
     registry: &PartnerRegistry,
     rate_limiter: &dyn RateLimiter,
@@ -141,21 +148,23 @@ fn handle_batch_sync_with_writer(
     }
 
     // 3. Parse body (with size limit to prevent OOM before validation)
-    const MAX_BODY_SIZE: usize = 2 * 1024 * 1024; // 2 MB
-    if content_length_exceeds_limit(&req, MAX_BODY_SIZE) {
-        return Ok(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-        ));
-    }
-
-    let body_bytes = req.into_body().into_bytes().unwrap_or_default();
-    if body_bytes.len() > MAX_BODY_SIZE {
-        return Ok(error_response(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "body_too_large",
-        ));
-    }
+    let (parts, body) = req.into_parts();
+    let body_bytes = match read_request_body(&parts.headers, body, MAX_BODY_SIZE).await {
+        Ok(bytes) => bytes,
+        Err(report)
+            if matches!(
+                report.current_context(),
+                TrustedServerError::RequestTooLarge { .. }
+            ) =>
+        {
+            log::warn!("Rejecting batch sync request: {report:?}");
+            return Ok(error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body_too_large",
+            ));
+        }
+        Err(report) => return Err(report),
+    };
     let body: BatchSyncRequest = serde_json::from_slice(&body_bytes).map_err(|e| {
         Report::new(TrustedServerError::BadRequest {
             message: format!("Invalid request body: {e}"),
@@ -183,14 +192,6 @@ fn handle_batch_sync_with_writer(
     };
 
     json_response(status, &response_body)
-}
-
-fn content_length_exceeds_limit(req: &Request<EdgeBody>, max_body_size: usize) -> bool {
-    req.headers()
-        .get("content-length")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|value| value.parse::<usize>().ok())
-        .is_some_and(|content_length| content_length > max_body_size)
 }
 
 /// Validates all mappings, then processes each normalized EC ID once.
@@ -311,6 +312,8 @@ mod tests {
     use crate::error::TrustedServerError;
     use crate::redacted::Redacted;
     use crate::settings::EcPartner;
+    use crate::test_support::body_read::{body_read_failure_cases, streamed_over};
+    use crate::test_support::logging::LogCapture;
 
     // EC ID validation tests are in generation.rs (is_valid_ec_id).
     // Verify the import works here with a basic smoke test.
@@ -438,43 +441,6 @@ mod tests {
     }
 
     #[test]
-    fn content_length_exceeds_limit_detects_oversized_header() {
-        let req = Request::builder()
-            .method("POST")
-            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
-            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
-            .header("content-length", "2097153")
-            .body(EdgeBody::from("{}"))
-            .expect("should build test request");
-
-        assert!(
-            content_length_exceeds_limit(&req, 2 * 1024 * 1024),
-            "should reject oversized content-length before reading body"
-        );
-    }
-
-    #[test]
-    fn content_length_exceeds_limit_ignores_missing_or_malformed_header() {
-        let missing = authorized_batch_request("{}");
-        let malformed = Request::builder()
-            .method("POST")
-            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
-            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
-            .header("content-length", "not-a-number")
-            .body(EdgeBody::from("{}"))
-            .expect("should build test request");
-
-        assert!(
-            !content_length_exceeds_limit(&missing, 2 * 1024 * 1024),
-            "missing content-length should fall back to post-read size check"
-        );
-        assert!(
-            !content_length_exceeds_limit(&malformed, 2 * 1024 * 1024),
-            "malformed content-length should fall back to post-read size check"
-        );
-    }
-
-    #[test]
     fn handle_batch_sync_rejects_oversized_content_length_before_body_parse() {
         let writer = MockWriter::new(vec![]);
         let registry = test_registry();
@@ -489,8 +455,10 @@ mod tests {
             .body(EdgeBody::from("not-json"))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
@@ -515,14 +483,101 @@ mod tests {
             .body(EdgeBody::from(oversized_body))
             .expect("should build test request");
 
-        let response = handle_batch_sync_with_writer(&writer, &registry, &limiter, req)
-            .expect("should return oversized response");
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
 
         assert_eq!(
             response.status(),
             StatusCode::PAYLOAD_TOO_LARGE,
             "should reject oversized body even when content-length is malformed"
         );
+    }
+
+    /// Returns an authorized batch-sync request builder with no body yet.
+    fn authorized_batch_builder() -> http::request::Builder {
+        Request::builder()
+            .method("POST")
+            .uri("https://edge.example.com/_ts/api/v1/batch-sync")
+            .header("authorization", "Bearer test-token-32-bytes-minimum-value")
+    }
+
+    #[test]
+    fn batch_sync_body_read_failures_map_to_statuses() {
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+
+        for case in body_read_failure_cases(MAX_BODY_SIZE) {
+            let writer = MockWriter::new(vec![]);
+            let (req, expectation) = case.into_request(authorized_batch_builder());
+
+            let capture = LogCapture::start();
+            let outcome = futures::executor::block_on(handle_batch_sync_with_writer(
+                &writer, &registry, &limiter, req,
+            ));
+
+            expectation.assert_outcome("batch sync", &outcome);
+            assert!(
+                writer.calls().is_empty(),
+                "should not write any mapping for the {} case",
+                expectation.name()
+            );
+            if expectation.expected() == StatusCode::PAYLOAD_TOO_LARGE {
+                let levels: Vec<log::Level> = capture
+                    .take_all()
+                    .iter()
+                    .map(|record| record.level)
+                    .collect();
+                assert_eq!(
+                    levels,
+                    [log::Level::Warn],
+                    "should log the {} case once, at warn",
+                    expectation.name()
+                );
+                let response = outcome.expect("should answer an overflow with a response");
+                assert_eq!(
+                    response_json(response),
+                    serde_json::json!({ "error": "body_too_large" }),
+                    "should keep the body_too_large error body for the {} case",
+                    expectation.name()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_sync_stream_past_declared_length_and_cap_returns_413() {
+        let writer = MockWriter::new(vec![]);
+        let registry = test_registry();
+        let limiter = MockRateLimiter {
+            should_exceed: false,
+        };
+        // The declared length is valid and small, so only the bounded read can
+        // stop a stream that runs past both it and the cap.
+        let req = authorized_batch_builder()
+            .header("content-length", "2")
+            .body(streamed_over(MAX_BODY_SIZE))
+            .expect("should build test request");
+
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
+            &writer, &registry, &limiter, req,
+        ))
+        .expect("should return oversized response");
+
+        assert_eq!(
+            response.status(),
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "should reject a stream past its declared length and the cap"
+        );
+        assert_eq!(
+            response_json(response),
+            serde_json::json!({ "error": "body_too_large" }),
+            "should keep the body_too_large error body"
+        );
+        assert!(writer.calls().is_empty(), "should not write any mapping");
     }
 
     #[test]
@@ -593,7 +648,8 @@ mod tests {
             .expect("should build test request");
 
         let response =
-            handle_batch_sync(&kv, &registry, &limiter, req).expect("should return response");
+            futures::executor::block_on(handle_batch_sync(&kv, &registry, &limiter, req))
+                .expect("should return response");
         assert_eq!(
             response.status(),
             StatusCode::UNAUTHORIZED,
@@ -925,12 +981,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return success response");
 
         assert_eq!(
@@ -955,12 +1011,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id}","partner_uid":"one","timestamp":1}},{{"ec_id":"{ec_id}","partner_uid":"two","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return multi-status response");
 
         assert_eq!(
@@ -993,12 +1049,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"invalid","partner_uid":"one","timestamp":1}},{{"ec_id":"{valid_ec_id}","partner_uid":"","timestamp":2}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return validation response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);
@@ -1038,12 +1094,12 @@ mod tests {
             r#"{{"mappings":[{{"ec_id":"{ec_id_a}","partner_uid":"a-first","timestamp":1}},{{"ec_id":"{ec_id_b}","partner_uid":"b","timestamp":2}},{{"ec_id":"{ec_id_a}","partner_uid":"a-last","timestamp":3}},{{"ec_id":"{ec_id_c}","partner_uid":"c","timestamp":4}}]}}"#
         );
 
-        let response = handle_batch_sync_with_writer(
+        let response = futures::executor::block_on(handle_batch_sync_with_writer(
             &writer,
             &registry,
             &limiter,
             authorized_batch_request(&body),
-        )
+        ))
         .expect("should return infrastructure failure response");
 
         assert_eq!(response.status(), StatusCode::MULTI_STATUS);

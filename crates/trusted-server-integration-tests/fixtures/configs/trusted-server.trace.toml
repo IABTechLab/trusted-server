@@ -34,9 +34,6 @@ gam_attribution_enabled = false
 script_url = "https://ads.example.com/gpt.js"
 rewrite_script = false
 
-[proxy]
-certificate_check = false
-
 [auction]
 enabled = true
 timeout_ms = 1000

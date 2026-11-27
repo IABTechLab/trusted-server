@@ -156,6 +156,7 @@ mod tests {
 
     struct EchoSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for EchoSecretStore {
         fn get_bytes(
             &self,
@@ -170,7 +171,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -179,13 +180,18 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
 
     struct UnifiedSecretStore;
 
+    #[async_trait::async_trait(?Send)]
     impl PlatformSecretStore for UnifiedSecretStore {
         fn get_bytes(
             &self,
@@ -212,7 +218,7 @@ mod tests {
             Ok(value.as_bytes().to_vec())
         }
 
-        fn create(
+        async fn create(
             &self,
             _store_id: &StoreId,
             _name: &str,
@@ -221,7 +227,11 @@ mod tests {
             Ok(())
         }
 
-        fn delete(&self, _store_id: &StoreId, _name: &str) -> Result<(), Report<PlatformError>> {
+        async fn delete(
+            &self,
+            _store_id: &StoreId,
+            _name: &str,
+        ) -> Result<(), Report<PlatformError>> {
             Ok(())
         }
     }
@@ -996,6 +1006,31 @@ mod tests {
 
         load_settings(&envelope_json(&original))
             .expect("runtime should accept disabled browser bidder ownership overlap");
+    }
+
+    #[test]
+    fn live_blob_with_operator_framing_headers_still_loads() {
+        // Push rejects these entries, but a blob pushed before the rejection
+        // still has to load. The response-header helper skips them when it serves.
+        for (name, value) in [
+            ("connection", "keep-alive,"),
+            ("connection", ""),
+            ("trailer", "expires"),
+        ] {
+            let mut settings = test_settings();
+            settings
+                .response_headers
+                .insert(name.to_owned(), value.to_owned());
+
+            let loaded = load_settings(&envelope_json(&settings))
+                .expect("should keep loading a live config that predates the rejection");
+
+            assert_eq!(
+                loaded.response_headers.get(name).map(String::as_str),
+                Some(value),
+                "should keep the {name} entry for the response-header helper to skip"
+            );
+        }
     }
 
     #[test]
