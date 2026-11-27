@@ -1,11 +1,13 @@
 use http::header::HeaderName;
 
 pub const COOKIE_TS_EC: &str = "ts-ec";
-/// Short-lived signed proof that the current EC row has every pull-partner UID.
+/// Retired pull-sync completeness marker; leftover cookies are expired.
 pub const COOKIE_TS_EC_PULL_COMPLETE: &str = "ts-ec-pull-complete";
 /// Cookie written by the Trusted Server JS SDK containing a standard-base64-encoded
 /// JSON array of Extended User IDs (`[{ source, uids }]`) from identity providers.
 pub const COOKIE_TS_EIDS: &str = "ts-eids";
+/// JS-readable mirror of provider-owned bidstream UIDs (spec §10).
+pub const COOKIE_TS_EIDS_MIRROR: &str = "__Host-ts-eids-mirror";
 pub const COOKIE_TS_TESTER: &str = "ts-tester";
 pub const COOKIE_SHAREDID: &str = "sharedId";
 
