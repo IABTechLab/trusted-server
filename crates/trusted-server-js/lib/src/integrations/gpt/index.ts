@@ -1119,6 +1119,7 @@ function clearPreviousTargetingSnapshot(
 }
 
 function clearPreviousNavigationTargeting(ts: TsjsApi, g: Partial<GoogleTag>): void {
+  ts.prebidTargeting?.clear(g.pubads?.()?.getSlots?.() ?? []);
   const previousKeys = ts.prevSlotTargetingKeys ?? {};
   const touchedElementIds = new Set([
     ...Object.keys(previousKeys),

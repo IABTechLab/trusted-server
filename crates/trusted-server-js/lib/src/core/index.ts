@@ -15,6 +15,7 @@ import { log } from './log';
 import { setConfig, getConfig } from './config';
 import { requestAds } from './request';
 import { installQueue } from './queue';
+import { createPrebidTargetingBridge } from './prebid_targeting';
 
 const VERSION = '0.1.0';
 
@@ -37,6 +38,7 @@ api.setConfig = setConfig;
 api.getConfig = getConfig;
 // Provide core requestAds API
 api.requestAds = requestAds;
+api.prebidTargeting ??= createPrebidTargetingBridge(api);
 // Defensive defaults: the edge injects adSlots (head-open) and bids (before
 // </body>) only when server-side ad templates run for the request. When template
 // delivery is disabled or gated off (auction/consent, bots, prefetch), page code

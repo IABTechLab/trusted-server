@@ -85,10 +85,6 @@ function parseManifestList(value: unknown): string[] | undefined {
   return [...value];
 }
 
-function isManifestContainer(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   if (typeof window === 'undefined') {
     return undefined;
@@ -97,12 +93,12 @@ function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   // Page code can replace this global. Validate each nested list instead of
   // trusting the generated TypeScript shape.
   const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
-  if (!isManifestContainer(raw) || raw.schemaVersion !== 1) {
+  if (!isRecord(raw) || raw.schemaVersion !== 1) {
     return undefined;
   }
 
-  const modules = isManifestContainer(raw.modules) ? raw.modules : {};
-  const runtimeCodes = isManifestContainer(raw.runtimeCodes) ? raw.runtimeCodes : {};
+  const modules = isRecord(raw.modules) ? raw.modules : {};
+  const runtimeCodes = isRecord(raw.runtimeCodes) ? raw.runtimeCodes : {};
   return {
     schemaVersion: 1,
     modules: {
@@ -253,6 +249,10 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
   return [...bidders];
 }
 
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -279,11 +279,7 @@ function configuredUserIdEntries(config: unknown): PrebidUserIdConfigEntry[] {
 function hasUserIdsPath(config: unknown): config is Record<string, unknown> & {
   userSync: Record<string, unknown> & { userIds: unknown };
 } {
-  return (
-    isRecord(config) &&
-    isRecord(config.userSync) &&
-    Object.prototype.hasOwnProperty.call(config.userSync, 'userIds')
-  );
+  return isRecord(config) && isRecord(config.userSync) && hasOwn(config.userSync, 'userIds');
 }
 
 function configuredUserIdNamesFromConfig(config: unknown): string[] {
@@ -470,7 +466,8 @@ let auctionEndpoint = '/auction';
 export function auctionBidsToPrebidBids(
   auctionBids: AuctionBid[],
   bidRequests: Array<{ adUnitCode?: string; code?: string; bidId?: string }>,
-  apsRendererSupported: boolean
+  apsRendererSupported: boolean,
+  generation?: number
 ) {
   // Build a lookup from impid (adUnitCode) → original bidRequest
   const requestsByCode = new Map<string, (typeof bidRequests)[number]>();
@@ -497,6 +494,11 @@ export function auctionBidsToPrebidBids(
       return [];
     }
 
+    const selected =
+      bid.targeting === undefined
+        ? undefined
+        : window.tsjs?.prebidTargeting?.admit(pbjs, bid.impid, bid.targeting, generation);
+    if (bid.targeting !== undefined && !selected) return [];
     const origReq = requestsByCode.get(bid.impid);
     return [
       {
@@ -513,6 +515,7 @@ export function auctionBidsToPrebidBids(
         bidderCode: bid.seat,
         meta: {
           advertiserDomains: bid.adomain,
+          ...(selected ? { tsjsSelectedTargeting: selected } : {}),
           // Second descriptor carrier. See APS_RENDERER_FIELD for the rationale.
           ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
         },
@@ -569,9 +572,7 @@ function isLegacyTcfConsentManagement(consentManagement: unknown): boolean {
  */
 function hasNamespacedConsentManagement(consentManagement: Record<string, unknown>): boolean {
   return CONSENT_MANAGEMENT_NAMESPACES.some(
-    (namespace) =>
-      Object.prototype.hasOwnProperty.call(consentManagement, namespace) &&
-      Boolean(consentManagement[namespace])
+    (namespace) => hasOwn(consentManagement, namespace) && Boolean(consentManagement[namespace])
   );
 }
 
@@ -871,10 +872,7 @@ function activateManagedUserIdTcfConsent(
 }
 
 function publisherClaimsGdprOwnership(publisherConfig: PbjsConfig): boolean {
-  if (
-    !isRecord(publisherConfig) ||
-    !Object.prototype.hasOwnProperty.call(publisherConfig, 'consentManagement')
-  ) {
+  if (!isRecord(publisherConfig) || !hasOwn(publisherConfig, 'consentManagement')) {
     return false;
   }
 
@@ -910,10 +908,7 @@ function removeAutomaticGdprNamespace(
     return;
   }
 
-  if (
-    !isRecord(effectiveConsentManagement) ||
-    !Object.prototype.hasOwnProperty.call(effectiveConsentManagement, 'gdpr')
-  ) {
+  if (!isRecord(effectiveConsentManagement) || !hasOwn(effectiveConsentManagement, 'gdpr')) {
     return;
   }
 
@@ -1014,6 +1009,7 @@ type TrustedServerRequest = {
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
   tracePending?: TracePendingHandle;
+  generation?: number;
 };
 
 type PrebidUserIdEid = {
@@ -1050,7 +1046,7 @@ function dispatchPrebidRefresh<T>(
   try {
     tsjs = window.tsjs;
     if (tsjs) {
-      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      hadOwnContext = hasOwn(tsjs, 'prebidRefreshDispatchInProgress');
       previousContext = tsjs.prebidRefreshDispatchInProgress;
       shouldRestoreContext = true;
       tsjs.prebidRefreshDispatchInProgress = true;
@@ -1100,7 +1096,7 @@ function sanitizeAuctionUid(uid: {
     sanitizedUid.atype = uid.atype;
   }
 
-  if (uid.ext && typeof uid.ext === 'object' && !Array.isArray(uid.ext)) {
+  if (isRecord(uid.ext)) {
     sanitizedUid.ext = uid.ext as Record<string, unknown>;
   }
 
@@ -1171,7 +1167,7 @@ function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefin
   }
 
   const mapping = window.tsjs?.divToSlotId;
-  const mappedId = mapping && Object.hasOwn(mapping, elementId) ? mapping[elementId] : undefined;
+  const mappedId = mapping && hasOwn(mapping, elementId) ? mapping[elementId] : undefined;
   const mappedSlot = mappedId ? slots.find((adSlot) => adSlot.id === mappedId) : undefined;
   if (mappedSlot) return mappedSlot;
 
@@ -1296,7 +1292,7 @@ function foldedBidderParams(
 /** Preserve authored presence and values, including invalid values for server validation. */
 function storedRequestParams(bid: TrustedServerBid | undefined): { storedRequest?: unknown } {
   if (!bid) return { storedRequest: false };
-  return Object.prototype.hasOwnProperty.call(bid.params ?? {}, STORED_REQUEST_KEY)
+  return hasOwn(bid.params ?? {}, STORED_REQUEST_KEY)
     ? { storedRequest: copyParamValue(bid.params?.[STORED_REQUEST_KEY]) }
     : {};
 }
@@ -1395,12 +1391,13 @@ function isExcludedFromRefreshAuction(
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
+  window.tsjs?.prebidTargeting?.clear([slot]);
   if (typeof slot.clearTargeting !== 'function') return;
 
   const elementId = refreshSlotElementId(slot);
   const recorded = window.tsjs?.prevSlotTargetingKeys;
   const entry =
-    elementId && recorded && Object.hasOwn(recorded, elementId) ? recorded[elementId] : undefined;
+    elementId && recorded && hasOwn(recorded, elementId) ? recorded[elementId] : undefined;
   const previousKeys = Array.isArray(entry) ? entry : [];
   for (const key of new Set([...TS_REFRESH_TARGETING_KEYS, ...previousKeys])) {
     slot.clearTargeting(key);
@@ -1657,8 +1654,7 @@ function publisherResponseAdIds(
   bidResponses: unknown
 ): Map<string, string[]> {
   const adIds = new Map<string, string[]>();
-  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses))
-    return adIds;
+  if (!isRecord(bidResponses)) return adIds;
 
   for (const [responseCode, responseGroup] of Object.entries(bidResponses)) {
     if (!responseGroup || typeof responseGroup !== 'object') continue;
@@ -2400,6 +2396,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         // map bids without relying on shared mutable adapter state.
         bidRequests: requestScopedBidRequests,
         tsjsBidRequests: requestScopedBidRequests,
+        generation: window.tsjs?.navGeneration ?? 0,
         ...(traceHandle ? { tracePending: traceHandle } : {}),
       };
     },
@@ -2418,7 +2415,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
-      return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
+      return auctionBidsToPrebidBids(
+        auctionBids,
+        bidRequests,
+        apsRendererSupported,
+        request?.generation
+      );
     },
   });
 

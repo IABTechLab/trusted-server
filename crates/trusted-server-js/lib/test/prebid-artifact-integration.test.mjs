@@ -26,6 +26,7 @@ let noAnalyticsArtifact;
 let managedUserIdArtifact;
 let shimCode;
 let coreCode;
+let gptCode;
 
 async function buildArtifact(modules) {
   await main(['--modules-json', JSON.stringify(modules), '--out', outputDirectory]);
@@ -88,6 +89,14 @@ beforeAll(async () => {
     logLevel: 'warn',
   });
   coreCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-core.js'), 'utf8');
+  await build(
+    moduleBuildOptions({
+      name: 'gpt',
+      entryPath: path.join(libDir, 'src/integrations/gpt/index.ts'),
+      outDir: outputDirectory,
+    })
+  );
+  gptCode = fs.readFileSync(path.join(outputDirectory, 'tsjs-gpt.js'), 'utf8');
   console.log('[trace-prebid-artifact] shim characters:', shimCode.length);
 }, 240_000);
 
@@ -823,7 +832,7 @@ describe('pinned Prebid public targeting contract', () => {
     };
   }
 
-  function serverResponse(cpm = price) {
+  function serverResponse(cpm = price, targeting) {
     return {
       id: 'example-auction',
       seatbid: [
@@ -839,6 +848,7 @@ describe('pinned Prebid public targeting contract', () => {
               crid: 'example-creative',
               adomain: ['example.com'],
               adm: '<div>Example server creative</div>',
+              ...(targeting ? { ext: { prebid: { targeting } } } : {}),
             },
           ],
         },
@@ -854,6 +864,9 @@ describe('pinned Prebid public targeting contract', () => {
     slots = [gptSlot()],
     respond,
     beforeShim,
+    core = true,
+    adUnitTargeting,
+    respondClient,
   } = {}) {
     const dom = createPage();
     const pageWindow = dom.window;
@@ -862,13 +875,15 @@ describe('pinned Prebid public targeting contract', () => {
     const element = pageWindow.document.createElement('div');
     element.id = code;
     pageWindow.document.body.appendChild(element);
-    const pubads = { getSlots: () => slots, refresh: vi.fn() };
+    const nativeRefresh = vi.fn();
+    const pubads = { getSlots: () => slots, refresh: nativeRefresh };
     pageWindow.googletag = {
       apiReady: true,
       pubadsReady: true,
       cmd: { push: (callback) => callback() },
       pubads: () => pubads,
     };
+    if (core) pageWindow.eval(coreCode);
     pageWindow.eval(noAnalyticsArtifact.bundleCode);
     pageWindow.pbjs.setConfig({ bidderTimeout: 1000, ...config });
     pageWindow.pbjs.bidderSettings = settings;
@@ -906,7 +921,14 @@ describe('pinned Prebid public targeting contract', () => {
     stubs.fetchSpy.mockImplementation(async (resource, init) => {
       stubs.requests.push({ transport: 'fetch', resource, init });
       const pathname = new URL(requestUrl(resource), 'https://pub.example.com').pathname;
-      if (pathname === '/example-client-bid') return new Response('{}');
+      if (pathname === '/example-client-bid') {
+        if (respondClient) await respondClient();
+        return new Response('{}');
+      }
+      if (pathname === '/_ts/page-bids')
+        return new Response(JSON.stringify({ slots: [], bids: {} }), {
+          headers: { 'Content-Type': 'application/json' },
+        });
       if (pathname !== '/auction') throw new Error(`Unexpected fixture path: ${pathname}`);
       const requestBody = init?.body ?? (await resource.text());
       const payload = JSON.parse(requestBody);
@@ -926,6 +948,7 @@ describe('pinned Prebid public targeting contract', () => {
       stubs,
       slots,
       targeted,
+      nativeRefresh,
       setClientBid: (value) => {
         clientBid = value;
       },
@@ -935,6 +958,7 @@ describe('pinned Prebid public targeting contract', () => {
             adUnits: [
               {
                 code,
+                ...(adUnitTargeting ? { adserverTargeting: adUnitTargeting } : {}),
                 mediaTypes: { banner: { sizes: [[300, 250]] } },
                 bids: [
                   ...(client === undefined ? [] : [{ bidder: clientCode, params: {} }]),
@@ -965,6 +989,658 @@ describe('pinned Prebid public targeting contract', () => {
       },
     };
   }
+
+  it('delivers finalized engine targeting through all public read APIs and GPT', async () => {
+    const engine = { hb_pb: '8.88', example_engine: 'selected', example_long_engine_key: 'long' };
+    const observed = [];
+    const page = targetingPage({
+      respond: () => serverResponse(price, engine),
+      beforeShim: (win) =>
+        win.pbjs.onEvent('setTargeting', () => {
+          observed.push(win.googletag.pubads().getSlots()[0].getTargeting('hb_pb'));
+        }),
+    });
+    try {
+      await page.auction();
+      const prebid = page.pageWindow.pbjs;
+      const bid = page.bids()[0];
+      expect(bid).toMatchObject({ bidderCode: seat, adapterCode: 'trustedServer', cpm: price });
+      expect(prebid.getAdserverTargeting([code])[code]).toMatchObject(engine);
+      expect(prebid.getAdserverTargetingForAdUnitCode(code)).toMatchObject(engine);
+      expect(
+        new URLSearchParams(prebid.getAdserverTargetingForAdUnitCodeStr(code)).get('hb_pb')
+      ).toBe('8.88');
+      expect((await page.target()).hb_pb).toEqual(['8.88']);
+      expect(page.slots[0].values.example_long_engine_key).toEqual(['long']);
+      expect(page.slots[0].values.hb_adid).toEqual([bid.adId]);
+      expect(observed).toEqual([['8.88']]);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('refuses a targeting-dependent bid if early core installation is unavailable', async () => {
+    const page = targetingPage({
+      core: false,
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      expect(page.bids().length).toBe(0);
+      expect(await page.target()).not.toHaveProperty('hb_pb');
+    } finally {
+      page.close();
+    }
+  });
+
+  it('does not project a losing local map onto a same-seat client winner', async () => {
+    const page = targetingPage({
+      config: { targetingControls: { allBidsCustomTargeting: true } },
+      client: { cpm: 3.39 },
+      respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'loser' }),
+    });
+    try {
+      await page.auction();
+      const target = await page.target();
+      expect(target.hb_pb).toEqual(['3.30']);
+      expect(target).not.toHaveProperty('example_engine');
+      expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code)).not.toHaveProperty(
+        'example_engine'
+      );
+    } finally {
+      page.close();
+    }
+  });
+
+  it('uses the native cached winning bid rather than the latest response', async () => {
+    const page = targetingPage({
+      config: { useBidCache: true },
+      respond: (_payload, index) =>
+        index === 0
+          ? serverResponse(4.39, { hb_pb: '7.77', example_engine: 'cached' })
+          : serverResponse(1.01),
+    });
+    try {
+      await page.auction();
+      const cachedId = page.bids()[0].adId;
+      await page.auction();
+      expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code)).toMatchObject({
+        hb_adid: cachedId,
+        hb_pb: '7.77',
+      });
+      expect((await page.target()).hb_adid).toEqual([cachedId]);
+      expect(page.slots[0].values.example_engine).toEqual(['cached']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('cleans dynamic keys through remote and no-bid refreshes while preserving publisher changes', async () => {
+    const slot = gptSlot();
+    const page = targetingPage({
+      slots: [slot],
+      respond: (_payload, index) =>
+        index === 0
+          ? serverResponse(price, {
+              hb_pb: '8.88',
+              section: 'engine',
+              example_engine: 'selected',
+              example_changed: 'selected',
+            })
+          : index === 1
+            ? serverResponse(2.39)
+            : { seatbid: [] },
+    });
+    try {
+      await page.auction();
+      await page.target();
+      expect(slot.values.section).toEqual(['engine']);
+      slot.setTargeting('example_changed', 'publisher-change');
+      await page.auction();
+      await page.target();
+      expect(slot.values.hb_pb).toEqual(['2.30']);
+      expect(slot.values.section).toEqual(['example-section']);
+      expect(slot.values.example_changed).toEqual(['publisher-change']);
+      expect(slot.values).not.toHaveProperty('example_engine');
+      await page.auction();
+      await page.target();
+      expect(slot.values).not.toHaveProperty('hb_adid');
+      expect(slot.values.section).toEqual(['example-section']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('binds finalized maps to actual path-matched and custom-matched GPT slots', async () => {
+    const pathSlot = gptSlot('example-path-div');
+    pathSlot.getAdUnitPath = () => code;
+    const customSlot = gptSlot('example-custom-div');
+    const page = targetingPage({
+      slots: [pathSlot, customSlot],
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      expect(pathSlot.values.hb_pb).toEqual(['8.88']);
+      expect(customSlot.values).not.toHaveProperty('hb_pb');
+      const predicates = [];
+      const matching = vi.fn(
+        (slot) =>
+          function (...args) {
+            predicates.push(args);
+            return slot === customSlot && args[0] === code;
+          }
+      );
+      await page.target(matching);
+      expect(matching).toHaveBeenCalledTimes(2);
+      expect(predicates).toEqual([
+        [code, 0, [code]],
+        [code, 0, [code]],
+      ]);
+      expect(customSlot.values.hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('falls back to native default matching when a custom builder returns a non-function', async () => {
+    const page = targetingPage({ respond: () => serverResponse(price, { hb_pb: '8.88' }) });
+    try {
+      await page.auction();
+      expect((await page.target(() => null)).hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('keeps host render identity and own prototype-looking targeting keys', async () => {
+    const engine = JSON.parse(
+      '{"hb_adid":"engine-id","hb_cache_host":"engine-host","hb_cache_path":"engine-path","ts_initial":"engine-marker","__proto__":"example-own-value","hb_pb":"8.88"}'
+    );
+    const page = targetingPage({
+      settings: { [seat]: { adserverTargeting: [{ key: 'hb_adid', val: 'publisher-id' }] } },
+      respond: () => serverResponse(price, engine),
+    });
+    try {
+      await page.auction();
+      const targeting = page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+      expect(targeting.hb_adid).toBe(page.bids()[0].adId);
+      expect(Object.hasOwn(targeting, '__proto__')).toBe(true);
+      expect(targeting.__proto__).toBe('example-own-value');
+      expect(targeting).not.toHaveProperty('hb_cache_host');
+      expect(targeting).not.toHaveProperty('hb_cache_path');
+      expect(targeting).not.toHaveProperty('ts_initial');
+      await page.target();
+      expect(page.slots[0].values.hb_adid).toEqual([page.bids()[0].adId]);
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each([
+    ['removed render ID', { targetingControls: { allowTargetingKeys: ['PRICE_BUCKET'] } }, {}],
+    ['targeting character budget', { targetingControls: { auctionKeyMaxChars: 1 } }, {}],
+    ['disabled standards', {}, { [seat]: { sendStandardTargeting: false, adserverTargeting: [] } }],
+    ['changed targeting lock', { targetingControls: { lock: 'hb_pb' } }, {}],
+  ])(
+    'refuses only local map bids for %s and keeps the client eligible',
+    async (_name, config, settings) => {
+      const page = targetingPage({
+        config,
+        settings,
+        client: { cpm: 0.99 },
+        clientCode: 'exampleClient',
+        respond: () => serverResponse(3.39, { hb_pb: '8.88' }),
+      });
+      try {
+        await page.auction();
+        const target = page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+        expect(target.hb_pb).not.toBe('8.88');
+        const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+        expect(local === undefined || local.cpm < 0).toBe(true);
+        expect(
+          page.bids().some((bid) => bid.bidderCode === 'exampleClient' && bid.cpm === 0.99)
+        ).toBe(true);
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('keeps an unchanged canonical render-ID lock compatible', async () => {
+    const page = targetingPage({
+      config: { targetingControls: { lock: 'hb_adid' } },
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      expect((await page.target()).hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('invalidates map-dependent preferred deals after a configuration change', async () => {
+    const page = targetingPage({
+      config: { targetingControls: { alwaysIncludeDeals: true } },
+      respond: () => {
+        const body = serverResponse(price, { hb_pb: '8.88' });
+        body.seatbid[0].bid[0].dealid = 'example-deal';
+        return body;
+      },
+      beforeShim: (win) =>
+        win.pbjs.onEvent('bidResponse', (bid) => {
+          bid.dealId = 'example-deal';
+        }),
+    });
+    try {
+      await page.auction();
+      page.pageWindow.pbjs.setConfig({
+        targetingControls: { allowTargetingKeys: ['PRICE_BUCKET'], alwaysIncludeDeals: true },
+      });
+      const target = page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+      expect(target).not.toHaveProperty('hb_pb');
+      expect(Object.keys(target).some((key) => key.startsWith('hb_deal'))).toBe(false);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('refuses a response from an older navigation generation', async () => {
+    let release;
+    const page = targetingPage({
+      respond: async () => {
+        await new Promise((resolve) => {
+          release = resolve;
+        });
+        return serverResponse(price, { hb_pb: '8.88' });
+      },
+    });
+    try {
+      const auction = page.auction();
+      await vi.waitFor(() => expect(release).toEqual(expect.any(Function)));
+      page.pageWindow.tsjs.navGeneration = 1;
+      release();
+      await auction;
+      expect(page.bids().length).toBe(0);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('cleans old slot keys and excludes cached local bids after navigation', async () => {
+    const page = targetingPage({
+      config: { useBidCache: true },
+      respond: (_payload, index) =>
+        index === 0
+          ? serverResponse(4.39, { hb_pb: '8.88', example_engine: 'selected' })
+          : serverResponse(price),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      page.pageWindow.tsjs.navGeneration = 1;
+      await page.auction();
+      expect((await page.target()).hb_pb).toEqual(['1.20']);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+    } finally {
+      page.close();
+    }
+  });
+
+  it('refuses map-dependent bids if core loads after the controlled external bundle', async () => {
+    const page = targetingPage({
+      core: false,
+      beforeShim: (win) => win.eval(coreCode),
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      expect(page.bids().length).toBe(0);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('preserves comma-containing and empty finalized string values in GPT', async () => {
+    const engine = { example_comma: 'one,two', example_empty: '' };
+    const page = targetingPage({ respond: () => serverResponse(price, engine) });
+    try {
+      await page.auction();
+      expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code)).toMatchObject(engine);
+      await page.target();
+      expect(page.slots[0].values.example_comma).toEqual(['one,two']);
+      expect(page.slots[0].values.example_empty).toEqual(['']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('does not reuse a GPT receipt for an AST event from a publisher listener', async () => {
+    let nested = false;
+    const page = targetingPage({
+      config: { targetingControls: { lock: 'hb_adid' } },
+      respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+      beforeShim: (win) => {
+        win.apntag = { setKeywords: vi.fn(), getTag: () => ({ keywords: {} }) };
+        win.pbjs.onEvent('setTargeting', () => {
+          if (nested) return;
+          nested = true;
+          win.pbjs.setTargetingForAst([code]);
+        });
+      },
+    });
+    try {
+      await page.auction();
+      page.pageWindow.pbjs.setTargetingForGPTAsync([code]);
+      expect(page.targeted).toHaveLength(2);
+      expect(page.slots[0].values.example_engine).toEqual(['selected']);
+      expect(page.slots[0].values.hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('keeps nested GPT invocations bound to their own matched slots', async () => {
+    const first = gptSlot();
+    const second = gptSlot('example-nested-div');
+    const page = targetingPage({
+      slots: [first, second],
+      respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      let nested = false;
+      page.pageWindow.pbjs.setTargetingForGPTAsync([code], (slot) => {
+        if (!nested) {
+          nested = true;
+          page.pageWindow.pbjs.setTargetingForGPTAsync(
+            [code],
+            (candidate) => () => candidate === second
+          );
+        }
+        return () => slot === first;
+      });
+      expect(page.targeted).toHaveLength(2);
+      expect(first.values.example_engine).toEqual(['selected']);
+      expect(second.values.example_engine).toEqual(['selected']);
+      expect(first.values.hb_pb).toEqual(['8.88']);
+      expect(second.values.hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('ignores AST events raised inside a custom GPT matching callback', async () => {
+    const page = targetingPage({ respond: () => serverResponse(price, { hb_pb: '8.88' }) });
+    try {
+      await page.auction();
+      page.pageWindow.apntag = { setKeywords: vi.fn(), getTag: () => ({ keywords: {} }) };
+      page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
+        page.pageWindow.pbjs.setTargetingForAst([code]);
+        return () => true;
+      });
+      expect(page.slots[0].values.hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each(['navigation', 'identity', 'lock'])(
+    'refuses selected native fallback if matching changes %s prerequisites',
+    async (change) => {
+      const page = targetingPage({
+        respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+      });
+      try {
+        await page.auction();
+        page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
+          if (change === 'navigation') page.pageWindow.tsjs.navGeneration = 1;
+          else
+            page.pageWindow.pbjs.setConfig({
+              targetingControls:
+                change === 'identity'
+                  ? { allowTargetingKeys: ['PRICE_BUCKET'] }
+                  : { lock: 'hb_pb' },
+            });
+          return () => true;
+        });
+        expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+        expect(page.slots[0].values).not.toHaveProperty('hb_pb');
+        expect(page.targeted[0][code]).not.toHaveProperty('hb_pb');
+        expect(page.slots[0].values.section).toEqual(['example-section']);
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('refuses a local map when public ad-unit targeting replaces native render identity', async () => {
+    const page = targetingPage({
+      adUnitTargeting: { hb_adid: 'example-publisher-id' },
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      expect(page.bids().every((bid) => bid.adapterCode !== 'trustedServer' || bid.cpm < 0)).toBe(
+        true
+      );
+      const target = page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+      expect(target.hb_pb).not.toBe('8.88');
+      expect(target.hb_pb).not.toBe('1.20');
+    } finally {
+      page.close();
+    }
+  });
+
+  it('bounds finalized maps and unit admission without evicting an admitted unit', async () => {
+    const page = targetingPage({ respond: () => serverResponse(price, { hb_pb: '8.88' }) });
+    try {
+      const bridge = page.pageWindow.tsjs.prebidTargeting;
+      const prebid = page.pageWindow.pbjs;
+      for (let index = 0; index < 1023; index++)
+        expect(bridge.admit(prebid, `example-unit-${index}`, {}, 0)).toBeDefined();
+      await page.auction();
+      expect(bridge.admit(prebid, 'example-overflow', {}, 0)).toBeUndefined();
+      expect(bridge.admit(prebid, code, { example_value: 'still-admitted' }, 0)).toBeDefined();
+      expect(
+        bridge.admit(
+          prebid,
+          code,
+          Object.fromEntries(
+            Array.from({ length: 129 }, (_, index) => [`example_${index}`, 'value'])
+          ),
+          0
+        )
+      ).toBeUndefined();
+      expect(bridge.admit(prebid, code, { example_value: 'x'.repeat(8193) }, 0)).toBeUndefined();
+      expect(
+        bridge.admit(
+          prebid,
+          code,
+          Object.fromEntries(
+            Array.from({ length: 9 }, (_, index) => [`example_${index}`, 'x'.repeat(8192)])
+          ),
+          0
+        )
+      ).toBeUndefined();
+      expect(bridge.admit(prebid, code, { example_value: 'x'.repeat(8192) }, 0)).toBeDefined();
+      expect((await page.target()).hb_pb).toEqual(['8.88']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('invalidates a local bid when navigation changes before its pending auction completes', async () => {
+    let release;
+    const page = targetingPage({
+      config: { useBidCache: true },
+      client: { cpm: 0.99 },
+      clientCode: 'exampleClient',
+      respondClient: () =>
+        new Promise((resolve) => {
+          release = resolve;
+        }),
+      respond: () => serverResponse(4.39, { hb_pb: '8.88' }),
+    });
+    try {
+      let received = false;
+      page.pageWindow.pbjs.onEvent('bidResponse', (bid) => {
+        if (bid.adapterCode === 'trustedServer') received = true;
+      });
+      const auction = page.auction();
+      await vi.waitFor(() => {
+        expect(received).toBe(true);
+        expect(release).toEqual(expect.any(Function));
+      });
+      page.pageWindow.tsjs.navGeneration = 1;
+      page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+      release();
+      await auction;
+      expect((await page.target()).hb_pb).toEqual(['0.90']);
+      expect(page.bids().find((bid) => bid.adapterCode === 'trustedServer').cpm).toBeLessThan(0);
+    } finally {
+      page.close();
+    }
+  });
+
+  it('retains in-flight refusal identity when matching calls a targeting getter', async () => {
+    const page = targetingPage({
+      adUnitTargeting: { section: 'example-section' },
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
+        page.pageWindow.tsjs.navGeneration = 1;
+        page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+        return () => true;
+      });
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+      expect(page.slots[0].values).not.toHaveProperty('hb_pb');
+      expect(page.slots[0].values.section).toEqual(['example-section']);
+      expect(page.targeted[0][code].section).toBe('example-section');
+    } finally {
+      page.close();
+    }
+  });
+
+  it('preserves publisher ad-unit context when refusing a late local delivery', async () => {
+    const page = targetingPage({
+      adUnitTargeting: { section: 'example-section', hb_size: 'publisher-size' },
+      respond: () => serverResponse(price, { hb_pb: '8.88' }),
+    });
+    try {
+      await page.auction();
+      page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
+        page.pageWindow.tsjs.navGeneration = 1;
+        return () => true;
+      });
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+      expect(page.slots[0].values).not.toHaveProperty('hb_pb');
+      expect(page.slots[0].values.section).toEqual(['example-section']);
+      expect(page.slots[0].values.hb_size).toEqual(['publisher-size']);
+    } finally {
+      page.close();
+    }
+  });
+
+  it.each([seat, 'exampleLongBidderSeat'])(
+    'removes a refused %s native suffix namespace and preserves another bidder',
+    async (localSeat) => {
+      const page = targetingPage({
+        config: { enableSendAllBids: true },
+        client: { cpm: 0.99 },
+        clientCode: 'exampleClient',
+        respond: () => {
+          const body = serverResponse(price, { hb_pb: '8.88' });
+          body.seatbid[0].seat = localSeat;
+          return body;
+        },
+        beforeShim: (win) =>
+          win.pbjs.onEvent('bidResponse', (bid) => {
+            if (bid.adapterCode === 'trustedServer') {
+              bid.dealId = 'example-deal';
+              bid.adserverTargeting.hb_deal = 'example-deal';
+            }
+          }),
+      });
+      try {
+        await page.auction();
+        const localId = page.bids().find((bid) => bid.adapterCode === 'trustedServer').adId;
+        const clientId = page.bids().find((bid) => bid.bidderCode === 'exampleClient').adId;
+        page.pageWindow.pbjs.setTargetingForGPTAsync([code], () => {
+          page.pageWindow.tsjs.navGeneration = 1;
+          page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(code);
+          return () => true;
+        });
+        expect(page.slots[0].values.hb_pb_exampleClient).toEqual(['0.90']);
+        expect(page.slots[0].values.hb_adid_exampleClien).toEqual([clientId]);
+        const values = Object.values(page.slots[0].values).flat();
+        expect(values).not.toContain(localId);
+        expect(values).not.toContain(localSeat);
+        expect(values).not.toContain('1.20');
+        expect(values).not.toContain('example-deal');
+      } finally {
+        page.close();
+      }
+    }
+  );
+
+  it('cleans engine keys immediately on actual SPA navigation without another Prebid targeting call', async () => {
+    const page = targetingPage({
+      adUnitTargeting: { section: 'example-section' },
+      respond: () =>
+        serverResponse(price, { hb_pb: '8.88', section: 'engine', example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      page.pageWindow.eval(gptCode);
+      page.pageWindow.history.pushState({}, '', '/example-next-page');
+      expect(page.pageWindow.tsjs.navGeneration).toBe(1);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      expect(page.slots[0].values.section).toEqual(['example-section']);
+      await vi.waitFor(() =>
+        expect(
+          page.stubs.requests.some((entry) => requestUrl(entry.resource).includes('/_ts/page-bids'))
+        ).toBe(true)
+      );
+    } finally {
+      page.close();
+    }
+  });
+
+  it('cleans engine keys before forwarding GPT refresh after a synchronous auction failure', async () => {
+    const page = targetingPage({
+      adUnitTargeting: { section: 'example-section' },
+      respond: () =>
+        serverResponse(price, { hb_pb: '8.88', section: 'engine', example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      await page.target();
+      // Consume the publisher's first-impression refresh before exercising its
+      // later replacement auction and synchronous-failure fallback.
+      page.pageWindow.googletag.pubads().refresh([page.slots[0]]);
+      page.nativeRefresh.mockClear();
+      const requestBids = vi.fn(() => {
+        throw new Error('example refresh failure');
+      });
+      page.pageWindow.pbjs.requestBids = requestBids;
+      page.pageWindow.googletag.pubads().refresh([page.slots[0]]);
+      expect(requestBids).toHaveBeenCalledTimes(1);
+      expect(page.nativeRefresh).toHaveBeenCalledTimes(1);
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      expect(page.slots[0].values.section).toEqual(['example-section']);
+      expect(page.stubs.consoleErrors).toHaveLength(1);
+      expect(page.stubs.consoleErrors[0]).toContain('example refresh failure');
+      page.stubs.consoleErrors.splice(0);
+    } finally {
+      page.close();
+    }
+  });
 
   it.each([
     ['low', '1.00'],

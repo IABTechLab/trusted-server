@@ -462,7 +462,7 @@ describe('auctioneer targeting response carrier', () => {
     expect(bids.map((bid) => bid.targeting)).toEqual([first, second]);
     expect(bids[0].targeting).not.toBe(first);
     expect(Object.getPrototypeOf(bids[0].targeting)).toBe(Object.prototype);
-    expect(Object.hasOwn(bids[0].targeting!, '__proto__')).toBe(true);
+    expect(Object.prototype.hasOwnProperty.call(bids[0].targeting!, '__proto__')).toBe(true);
     expect(bids[0].price).toBe(1.234);
   });
 

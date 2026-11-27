@@ -282,7 +282,7 @@ describe('installTsAdInit', () => {
       expect(ts.prevSlotTargetingKeys!['div-atf-sidebar'].slice().sort()).toEqual(
         Object.keys(applied).sort()
       );
-      expect(mockSlot.setTargeting.mock.invocationCallOrder.at(-1)).toBeLessThan(
+      expect(mockSlot.setTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
         mockPubads.refresh.mock.invocationCallOrder[0]
       );
     }

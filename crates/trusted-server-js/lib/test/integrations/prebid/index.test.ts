@@ -161,6 +161,7 @@ interface TestBid {
 
 /** Loose ad unit shape used by the requestBids shim tests. */
 interface TestAdUnit {
+  mediaTypes?: { banner: { sizes: number[][]; name?: string } };
   code?: string;
   bids?: TestBid[];
 }
@@ -3902,7 +3903,7 @@ describe('prebid/installRefreshHandler', () => {
         {
           code,
           mediaTypes: { banner: { name: 'live-zone', sizes: [[300, 250]] } },
-          bids: reverse ? bids.toReversed() : bids,
+          bids: reverse ? [...bids].reverse() : bids,
         },
       ];
       testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
@@ -3916,7 +3917,7 @@ describe('prebid/installRefreshHandler', () => {
       testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
       installRefreshHandler();
       pubads.refresh([slot]);
-      const requested = mockRequestBids.mock.calls.at(-1)![0].adUnits[0];
+      const requested = mockRequestBids.mock.calls.slice(-1)[0]![0].adUnits[0];
       expect(requested.bids).toEqual([
         {
           bidder: 'trustedServer',
@@ -3926,7 +3927,7 @@ describe('prebid/installRefreshHandler', () => {
             bidderParams: { exampleServer: { source: reverse ? 'first-raw' : 'last-folded' } },
           },
         },
-        ...(reverse ? clients.toReversed() : clients),
+        ...(reverse ? [...clients].reverse() : clients),
       ]);
       expect(requested.bids[1].params).not.toBe((reverse ? clients[1] : clients[0]).params);
     }
@@ -4031,7 +4032,7 @@ describe('prebid/installRefreshHandler', () => {
     expect(slotTargeting.get('custom_pb')).toEqual(['configured-price']);
     expect(slotTargeting.get('zone')).toEqual(['homepage']);
     expect(slotTargeting.get('section')).toEqual(['front']);
-    expect(clearTargeting.mock.invocationCallOrder.at(-1)).toBeLessThan(
+    expect(clearTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
       mockRequestBids.mock.invocationCallOrder[0]
     );
     expect(slotTargeting.get('publisher_key')).toEqual(['retain']);
@@ -4108,7 +4109,7 @@ describe('prebid/installRefreshHandler', () => {
     expect(values.has('custom_deal')).toBe(false);
     expect(values.has('hb_pb')).toBe(false);
     expect(values.get('publisher_key')).toEqual(['retain']);
-    expect(setTargeting.mock.invocationCallOrder.at(-1)).toBeLessThan(
+    expect(setTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
       originalRefresh.mock.invocationCallOrder[0]
     );
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], options);

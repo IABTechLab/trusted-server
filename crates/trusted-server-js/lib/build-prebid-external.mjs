@@ -524,6 +524,7 @@ export function renderExternalEntry({ includeUserIdModules }) {
     '// the trustedServer adapter and owns queue processing. This bundle only',
     '// drains the queue through the watchdog when that shim does not install.',
     "import 'prebid.js';",
+    "import '../targeting_bootstrap';",
     "import 'prebid.js/modules/consentManagementTcf.js';",
     "import 'prebid.js/modules/consentManagementGpp.js';",
     "import 'prebid.js/modules/consentManagementUsp.js';",
