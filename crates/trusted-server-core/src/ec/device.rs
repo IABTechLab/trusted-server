@@ -13,13 +13,16 @@
 //! - **`platform_class`** — coarse OS family from UA
 //! - **`h2_fp_hash`** — SHA256 prefix (12 hex chars) of raw H2 SETTINGS
 //! - **`known_browser`** — `true` if `ja4_class` + `h2_fp_hash` match a known
-//!   browser pattern; `false` for known bots; `None` for unknown. Only
-//!   `false` refuses identity creation and record writes; missing or unknown
-//!   signals never do.
+//!   browser pattern; `false` for known bots; `None` for unknown. Under the
+//!   default `lenient` browser gate only `false` refuses identity creation
+//!   and record writes; missing or unknown signals never do. The `strict`
+//!   gate also refuses a request without both `ja4_class` and
+//!   `platform_class`.
 
 use sha2::{Digest as _, Sha256};
 
 use super::kv_types::KvDevice;
+use crate::settings::BrowserGate;
 
 /// Device signals derived from a single request.
 ///
@@ -61,6 +64,43 @@ impl DeviceSignals {
             platform_class,
             h2_fp_hash,
             known_browser,
+        }
+    }
+
+    /// Returns `true` when the request looks like a real browser.
+    ///
+    /// Checks for the presence of recognizable signals rather than matching
+    /// against a hardcoded signal allowlist. Real browsers always
+    /// produce a valid TLS probabilistic identifier (`ja4_class`) and a recognizable UA
+    /// platform string (`platform_class`). Raw HTTP clients (curl, Python
+    /// requests, Go net/http, headless scrapers) typically lack one or both.
+    ///
+    /// # Threat model
+    ///
+    /// This heuristic is intentionally aimed at filtering obvious
+    /// missing-signal traffic, not at resisting deliberate spoofing. A bot
+    /// that forges plausible JA4 and UA inputs may still pass; deeper
+    /// consistency checks can be added later if product requirements demand
+    /// stronger spoof resistance.
+    ///
+    /// This check ignores `known_browser`; [`Self::allows_creation`] applies
+    /// it, and this check only under [`BrowserGate::Strict`].
+    #[must_use]
+    pub fn looks_like_browser(&self) -> bool {
+        self.ja4_class.is_some() && self.platform_class.is_some()
+    }
+
+    /// Returns `true` when these signals allow Edge Cookie creation under
+    /// `gate`.
+    ///
+    /// Both rules block a known non-browser fingerprint.
+    /// [`BrowserGate::Strict`] also requires [`Self::looks_like_browser`].
+    #[must_use]
+    pub fn allows_creation(&self, gate: BrowserGate) -> bool {
+        let known_non_browser = self.known_browser == Some(false);
+        match gate {
+            BrowserGate::Lenient => !known_non_browser,
+            BrowserGate::Strict => !known_non_browser && self.looks_like_browser(),
         }
     }
 
@@ -492,5 +532,110 @@ mod tests {
             Some("ios"),
             "iPad should be ios"
         );
+    }
+
+    #[test]
+    fn looks_like_browser_with_both_signals() {
+        let signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+            Some("1:65536;2:0;4:6291456;6:262144"),
+        );
+        assert!(
+            signals.looks_like_browser(),
+            "Chrome/Mac should look like a browser"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_unknown_fingerprint_still_passes() {
+        // Chrome/Windows with unknown JA4/H2 — still has ja4_class and platform_class
+        let signals = DeviceSignals::derive(
+            CHROME_WINDOWS_UA,
+            Some("t13d9999h2_unknown_unknown"),
+            Some("99:99;88:88"),
+        );
+        assert!(
+            signals.looks_like_browser(),
+            "unknown signal combination with valid JA4 + platform should pass"
+        );
+        assert_eq!(signals.known_browser, None, "should not match allowlist");
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_bot() {
+        let signals = DeviceSignals::derive(BOT_UA, None, None);
+        assert!(
+            !signals.looks_like_browser(),
+            "bot with no JA4 and no platform should be rejected"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_missing_ja4() {
+        // Real UA but no JA4 value (e.g. HTTP/1.1 or missing SDK support)
+        let signals = DeviceSignals::derive(CHROME_MAC_UA, None, Some("1:65536"));
+        assert!(
+            !signals.looks_like_browser(),
+            "missing JA4 should be rejected even with valid UA"
+        );
+    }
+
+    #[test]
+    fn looks_like_browser_rejects_missing_platform() {
+        // Has JA4 but unrecognizable UA
+        let signals = DeviceSignals::derive(BOT_UA, Some("t13d1516h2_abc_def"), None);
+        assert!(
+            !signals.looks_like_browser(),
+            "unrecognizable UA should be rejected even with JA4"
+        );
+    }
+
+    #[test]
+    fn lenient_gate_allows_creation_without_ja4() {
+        let signals = DeviceSignals::derive(CHROME_MAC_UA, None, None);
+
+        assert!(
+            signals.allows_creation(BrowserGate::Lenient),
+            "should not block a client only because JA4 is missing"
+        );
+    }
+
+    #[test]
+    fn strict_gate_requires_ja4_and_platform() {
+        for (ua, ja4, allowed) in [
+            (
+                CHROME_MAC_UA,
+                Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+                true,
+            ),
+            (CHROME_MAC_UA, None, false),
+            (BOT_UA, Some("t13d1516h2_8daaf6152771_e5627efa2ab1"), false),
+        ] {
+            let signals = DeviceSignals::derive(ua, ja4, None);
+
+            assert_eq!(
+                signals.allows_creation(BrowserGate::Strict),
+                allowed,
+                "should require both JA4 and platform for {ua:?} with JA4 {ja4:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_gates_block_a_known_non_browser() {
+        let mut signals = DeviceSignals::derive(
+            CHROME_MAC_UA,
+            Some("t13d1516h2_8daaf6152771_e5627efa2ab1"),
+            None,
+        );
+        signals.known_browser = Some(false);
+
+        for gate in [BrowserGate::Lenient, BrowserGate::Strict] {
+            assert!(
+                !signals.allows_creation(gate),
+                "should block a known non-browser fingerprint under {gate:?}"
+            );
+        }
     }
 }
