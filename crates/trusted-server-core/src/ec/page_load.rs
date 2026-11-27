@@ -9,18 +9,22 @@
 //! Three writes fall outside this rule. [`AfterResponseWrite`], confirmed
 //! alongside the page load's permit, allows one follow-up update after the
 //! response has been sent, carrying only the results of after-response
-//! identity lookups. A consent withdrawal's tombstone is a privacy write on
-//! any request that carries the EC cookie, and takes no permit. Auction body EIDs
-//! use a separate conditional update of an existing live row; that operation
-//! cannot create or recover identity and never receives a navigation permit.
+//! identity lookups. The graph spends it once and makes its one bounded
+//! update under it, so at most one follow-up update lands. A consent
+//! withdrawal's tombstone is a privacy write on any request that carries the
+//! EC cookie, and takes no permit. Auction body EIDs use a separate
+//! conditional update of an existing live row; that operation cannot create
+//! or recover identity and never receives a navigation permit.
 //!
 //! [`KvIdentityGraph::commit_page_load`]: super::kv::KvIdentityGraph::commit_page_load
 
 use edgezero_core::body::Body as EdgeBody;
+use error_stack::Report;
 use http::{Request, StatusCode};
 
 use super::EcKvSnapshot;
 use super::kv_types::KvEntry;
+use crate::error::TrustedServerError;
 use crate::http_util::is_navigation_request;
 
 /// Issued to a request classified as a page-load navigation.
@@ -108,8 +112,12 @@ impl PageLoadWrite {
 /// response has been sent.
 ///
 /// Issued only by [`NavigationPermit::confirm_with_after_response`] and
-/// consumed by [`KvIdentityGraph::commit_after_response`]. It is not `Clone`,
-/// so a navigation makes at most one follow-up write.
+/// consumed by [`KvIdentityGraph::commit_after_response`], which spends it
+/// before its first read, whether or not a write follows. That call's bounded
+/// update re-reads and re-plans only after a write that lost its CAS and so
+/// wrote nothing, and stops at the first write that lands, so at most one
+/// follow-up write lands. It is not `Clone`, so a navigation makes that call
+/// at most once.
 ///
 /// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
 #[derive(Debug)]
@@ -125,6 +133,39 @@ impl AfterResponseWrite {
     pub fn for_test() -> Self {
         Self(())
     }
+}
+
+/// What [`KvIdentityGraph::commit_after_response`] did.
+///
+/// [`KvIdentityGraph::commit_after_response`]: super::kv::KvIdentityGraph::commit_after_response
+#[derive(Debug)]
+#[must_use]
+pub struct AfterResponseCommit<S> {
+    /// `Ok` when the update landed.
+    pub result: Result<(), AfterResponseRejection<S>>,
+    /// The number of attempts that lost their CAS.
+    pub conflicts: u8,
+}
+
+/// Why a follow-up update did not land.
+#[derive(Debug)]
+pub enum AfterResponseRejection<S> {
+    /// The plan for the row as read has nothing to write, for the reason the
+    /// planner gave.
+    Skipped(S),
+    /// The row changed since each read, the retry's included, so the results
+    /// are dropped.
+    Conflict,
+    /// After a lost CAS, the re-read returned the generation that had just
+    /// lost or no row at all, though the lost CAS proves the row exists at a
+    /// newer generation, so the results are dropped without a second write.
+    StaleRead,
+    /// Reading or writing the row failed in the store's conditional update,
+    /// or the row as read could not be parsed. It was not retried.
+    StoreFailed(Report<TrustedServerError>),
+    /// The planned row could not be serialized, or the last-write-wins write
+    /// of a store without a conditional update failed.
+    WriteFailed(Report<KvWriteError>),
 }
 
 /// KV generation a conditional write expects.
