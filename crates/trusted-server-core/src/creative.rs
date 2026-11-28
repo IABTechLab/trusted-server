@@ -1168,9 +1168,12 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// 1 MiB. The creative runtime is always injected; its click guard acts only
 /// on links wrapped by this pass.
 ///
-/// This pass runs only while `/first-party/proxy` is on
-/// (`[auction] rewrite_creatives = true`), and it always rewrites assets.
-/// Click wrapping follows [`AuctionConfig::rewrites_proxied_clicks`].
+/// The `/first-party/proxy` route runs this pass only while
+/// `[auction] rewrite_creatives = true`; otherwise the route answers its
+/// turned-off `404`. Other proxy callers that do not stream, such as the
+/// Google Tag Manager integration, still run it on HTML responses whatever
+/// `rewrite_creatives` says. Asset rewriting is unconditional, and click
+/// wrapping follows [`AuctionConfig::rewrites_proxied_clicks`].
 ///
 /// [`AuctionConfig::rewrites_proxied_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_proxied_clicks
 #[must_use]
