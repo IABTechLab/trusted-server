@@ -8,6 +8,8 @@ mod config;
 mod origin;
 #[path = "html_eof_runtime/process.rs"]
 mod process;
+#[path = "html_eof_runtime/production.rs"]
+mod production;
 
 use std::collections::BTreeMap;
 use std::ffi::OsString;
@@ -983,4 +985,10 @@ fn timeout_proof_requires_measured_evidence() {
         None,
         "should not invent a cooperative timer measurement"
     );
+}
+
+#[test]
+#[ignore = "requires the isolated production artifact worker image and supplied shipping binaries"]
+fn production_pbs_worker() -> HarnessResult<()> {
+    production::run()
 }

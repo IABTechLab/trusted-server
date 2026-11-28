@@ -1,4 +1,7 @@
 ;(() => {
+  const creativeOrigin =
+    window.__traceGptFixtureConfig?.creativeOrigin ||
+    'https://creative.example.com'
   const slots = new Map()
   const listeners = new Map()
   const requests = []
@@ -131,7 +134,7 @@
         const frame = document.createElement('iframe')
         frame.width = '300'
         frame.height = '250'
-        frame.src = `https://creative.example.com/fixture-puc?adId=${encodeURIComponent(adId)}`
+        frame.src = `${creativeOrigin}/fixture-puc?adId=${encodeURIComponent(adId)}`
         document
           .getElementById(request.slot.getSlotElementId())
           .replaceChildren(frame)
