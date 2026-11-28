@@ -100,6 +100,32 @@ async function docker(args) {
   return result.stdout.trim()
 }
 
+async function removeOwnedResource(kind, name) {
+  try {
+    await docker(
+      kind === 'container' ? ['rm', '--force', name] : ['network', 'rm', name]
+    )
+  } catch (removalError) {
+    // A failed reply can also mean the owned resource is already absent.
+    // Only a successful inventory proves that cleanup no longer owns anything.
+    const names = await docker([
+      kind,
+      'ls',
+      ...(kind === 'container' ? ['--all'] : []),
+      '--filter',
+      `name=${name}`,
+      '--format',
+      kind === 'container' ? '{{.Names}}' : '{{.Name}}',
+    ])
+    if (
+      names
+        .split('\n')
+        .some((candidate) => candidate.replace(/^\//, '') === name)
+    )
+      throw removalError
+  }
+}
+
 async function main() {
   const { values } = parseArgs({
     options: {
@@ -165,6 +191,8 @@ async function main() {
   process.on('SIGINT', interrupt)
   process.on('SIGTERM', interrupt)
   try {
+    // Own the cleanup before the daemon can create a resource and lose its reply.
+    networkCreated = true
     await docker([
       'network',
       'create',
@@ -173,7 +201,6 @@ async function main() {
       'trusted-server.fixture=production-pbs',
       network,
     ])
-    networkCreated = true
     const args = [
       'create',
       '--name',
@@ -304,7 +331,7 @@ async function main() {
     try {
       if (containerCreated) {
         try {
-          await docker(['rm', '--force', name])
+          await removeOwnedResource('container', name)
           containerRemoved = true
         } catch (error) {
           cleanupErrors.push(error)
@@ -312,7 +339,7 @@ async function main() {
       }
       if (networkCreated) {
         try {
-          await docker(['network', 'rm', network])
+          await removeOwnedResource('network', network)
           networkRemoved = true
         } catch (error) {
           cleanupErrors.push(error)

@@ -1,4 +1,4 @@
-import { test, expect, type Page } from '@playwright/test'
+import { test, expect, type Page, type Response } from '@playwright/test'
 import { createHash } from 'node:crypto'
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
@@ -16,6 +16,70 @@ const helper = readFileSync(
   'utf8'
 )
 const evidence: unknown[] = []
+
+function receipts() {
+  return readFileSync('/results/receipts.jsonl', 'utf8')
+    .trim()
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => JSON.parse(line))
+}
+function auctionResponse(response: Response) {
+  const url = new URL(response.url())
+  return (
+    url.origin === 'http://localhost:18081' &&
+    url.pathname === '/auction' &&
+    response.request().method() === 'POST'
+  )
+}
+async function observeNoBid(response: Response, offset: number, phase: string) {
+  expect(
+    response.status(),
+    'no-bid must have a successful public response'
+  ).toBe(200)
+  const body = await response.json()
+  expect(typeof body.id).toBe('string')
+  expect(body.id.length).toBeGreaterThan(0)
+  expect(body.seatbid ?? []).toEqual([])
+  const summary = body.ext.orchestrator
+  expect(summary.providers).toBe(1)
+  expect(summary.total_bids).toBe(0)
+  expect(summary.provider_details).toHaveLength(1)
+  expect(
+    summary.provider_details[0].status,
+    'provider failure must not pass as no-bid'
+  ).toBe('nobid')
+  expect(summary.provider_details[0].bid_count).toBe(0)
+  const fresh = receipts().slice(offset)
+  const request = fresh.find(
+    (receipt) =>
+      receipt.method === 'POST' &&
+      receipt.path === '/openrtb2/auction' &&
+      JSON.parse(receipt.body).id === body.id
+  )
+  expect(
+    request,
+    'no-bid must reach the controlled backend in this auction'
+  ).toBeTruthy()
+  expect(request.host).toBe('pbs.example.com:18443')
+  expect(request.sni).toBe('pbs.example.com')
+  expect(request.port).toBe(18443)
+  const result = fresh.find(
+    (receipt) => receipt.auctionId === body.id && receipt.fixtureResponse
+  )
+  expect(result).toEqual({
+    fixtureResponse: 'no-bid',
+    auctionId: body.id,
+    status: 200,
+    bidCount: 0,
+  })
+  evidence.push({
+    phase,
+    noBidResponse: body,
+    backendRequest: request,
+    backendResponse: result,
+  })
+}
 
 async function visibleCreative(page: Page) {
   for (const frame of page.frames()) {
@@ -186,7 +250,11 @@ for (const mode of ['direct', 'publisher', 'empty'] as const) {
             })
         )
       }, mode === 'empty')
+      const offset = receipts().length
+      const response =
+        mode === 'empty' ? page.waitForResponse(auctionResponse) : null
       await page.evaluate(() => Reflect.get(window, 'fixtureRunAuction')())
+      if (response) await observeNoBid(await response, offset, 'fresh-empty')
     }
     await page.waitForFunction(
       () => Reflect.get(window, '__traceGptFixture').requests.length > 0
@@ -276,12 +344,19 @@ for (const mode of ['direct', 'publisher', 'empty'] as const) {
         .toBe(true)
       const renderedRefresh = await visibleCreative(page)
       writeFileSync('/work/bid-mode.json', JSON.stringify({ empty: true }))
+      const emptyOffset = receipts().length
+      const emptyResponse = page.waitForResponse(auctionResponse)
       await page.evaluate(() => {
         const gpt = Reflect.get(window, 'googletag')
         gpt.pubads().refresh(gpt.pubads().getSlots())
       })
       await page.waitForFunction(
         () => Reflect.get(window, '__traceGptFixture').requests.length === 3
+      )
+      await observeNoBid(
+        await emptyResponse,
+        emptyOffset,
+        'same-slot-empty-refresh'
       )
       const emptyRefresh = await page.evaluate(() => {
         const pbjs = Reflect.get(window, 'pbjs')
@@ -313,6 +388,60 @@ for (const mode of ['direct', 'publisher', 'empty'] as const) {
     evidence.push({ mode, snapshot, responses, violations: guard.violations })
   })
 }
+
+test('no-bid oracle rejects a controlled backend failure', async ({
+  page,
+  context,
+}) => {
+  const guard = await guardAuctionNetwork(context, manifest.allowedOrigins)
+  const [name, value] = manifest.consentCookie.split('=')
+  await context.addCookies([{ name, value, domain: 'localhost', path: '/' }])
+  await page.goto('/health')
+  writeFileSync('/work/bid-mode.json', JSON.stringify({ failure: true }))
+  const offset = receipts().length
+  const response = page.waitForResponse(auctionResponse)
+  await page.evaluate(async () => {
+    await fetch('/auction', {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        adUnits: [
+          {
+            code: 'failure-slot',
+            mediaTypes: { banner: { sizes: [[300, 250]] } },
+            bids: [
+              { bidder: 'example-bidder', params: { placement: 'fixture' } },
+            ],
+          },
+        ],
+      }),
+    })
+  })
+  const observed = await response
+  const body = await observed.json()
+  const failure = receipts()
+    .slice(offset)
+    .find(
+      (receipt) =>
+        receipt.fixtureResponse === 'failure' && receipt.auctionId === body.id
+    )
+  expect(failure).toEqual({
+    fixtureResponse: 'failure',
+    auctionId: body.id,
+    status: 500,
+  })
+  await expect(
+    observeNoBid(observed, offset, 'failure-must-reject')
+  ).rejects.toThrow(/provider failure must not pass as no-bid/)
+  guard.assertClean()
+  evidence.push({
+    negativeNoBidCase: 'backend-failure',
+    status: observed.status(),
+    body,
+    backendResponse: failure,
+    violations: guard.violations,
+  })
+})
 
 for (const [name, port] of [
   ['wrong-san', 18444],

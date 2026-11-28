@@ -52,10 +52,13 @@ async function handle(request, response) {
   if (url.pathname === '/openrtb2/auction') {
     const auction = JSON.parse(data)
     const mode = JSON.parse(readFileSync('/work/bid-mode.json', 'utf8'))
-    record({
-      fixtureResponse: mode.empty ? 'no-bid' : 'bid',
-      auctionId: auction.id,
-    })
+    if (mode.failure) {
+      record({ fixtureResponse: 'failure', auctionId: auction.id, status: 500 })
+      response
+        .writeHead(500, { 'content-type': 'application/json' })
+        .end(JSON.stringify({ error: 'Controlled backend failure' }))
+      return
+    }
     const bids = auction.imp
       .filter((imp) => !mode.empty && imp.id !== 'empty-slot')
       .map((imp) => ({
@@ -69,6 +72,12 @@ async function handle(request, response) {
         adomain: ['example.com'],
         ext: { prebid: { type: 'banner', bidder: 'example-bidder' } },
       }))
+    record({
+      fixtureResponse: bids.length ? 'bid' : 'no-bid',
+      auctionId: auction.id,
+      status: 200,
+      bidCount: bids.length,
+    })
     response.setHeader('content-type', 'application/json')
     response.end(
       JSON.stringify({
