@@ -22,10 +22,12 @@ use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use edgezero_core::http::request_builder;
 use edgezero_core::router::RouterService;
 use http::HeaderMap;
+use http_body_util::BodyExt as _;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp as AxumApp;
 use trusted_server_adapter_cloudflare::app::TrustedServerApp as CloudflareApp;
 use trusted_server_adapter_spin::app::TrustedServerApp as SpinApp;
+use trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY;
 use trusted_server_core::settings::Settings;
 use trusted_server_core::test_support::nextjs_auction;
 
@@ -53,26 +55,70 @@ fn test_settings() -> Settings {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [auction]
+            enabled = true
         "#,
     )
     .expect("should parse parity test settings")
 }
 
+/// Shared test settings with the auction and creative rewriting off.
+fn turned_off_settings() -> Settings {
+    Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "parity-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [auction]
+            enabled = false
+            rewrite_creatives = false
+        "#,
+    )
+    .expect("should parse turned-off parity test settings")
+}
+
 /// Build the Axum adapter router from the shared test settings.
 fn axum_router() -> RouterService {
-    AxumApp::routes_with_settings(test_settings())
+    axum_router_with(test_settings())
+}
+
+/// Build the Axum adapter router from `settings`.
+fn axum_router_with(settings: Settings) -> RouterService {
+    AxumApp::routes_with_settings(settings)
         .expect("should build Axum router from parity test settings")
 }
 
 /// Build the Cloudflare adapter router from the shared test settings.
 fn cf_router() -> RouterService {
-    CloudflareApp::routes_with_settings(test_settings())
+    cf_router_with(test_settings())
+}
+
+/// Build the Cloudflare adapter router from `settings`.
+fn cf_router_with(settings: Settings) -> RouterService {
+    CloudflareApp::routes_with_settings(settings)
         .expect("should build Cloudflare router from parity test settings")
 }
 
 /// Build the Spin adapter router from the shared test settings.
 fn spin_router() -> RouterService {
-    SpinApp::routes_with_settings(test_settings())
+    spin_router_with(test_settings())
+}
+
+/// Build the Spin adapter router from `settings`.
+fn spin_router_with(settings: Settings) -> RouterService {
+    SpinApp::routes_with_settings(settings)
         .expect("should build Spin router from parity test settings")
 }
 
@@ -96,14 +142,24 @@ async fn axum_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Axum adapter and return (status, headers, body bytes).
 async fn axum_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    use http_body_util::BodyExt as _;
-    let mut svc = EdgeZeroAxumService::new(axum_router());
+    axum_send(axum_router(), "POST", uri, body).await
+}
+
+/// Send a JSON request to `router` through the Axum service and return
+/// (status, headers, body bytes).
+async fn axum_send(
+    router: RouterService,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, HeaderMap, bytes::Bytes) {
+    let mut svc = EdgeZeroAxumService::new(router);
     let req = AxumRequest::builder()
-        .method("POST")
+        .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(AxumBody::from(body.to_owned()))
-        .expect("should build POST request");
+        .expect("should build request");
     let resp = svc
         .ready()
         .await
@@ -142,13 +198,23 @@ async fn cf_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Cloudflare adapter and return (status, headers, body bytes).
 async fn cf_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = cf_router();
+    cf_send(cf_router(), "POST", uri, body).await
+}
+
+/// Send a JSON request to the Cloudflare `router` and return
+/// (status, headers, body bytes).
+async fn cf_send(
+    router: RouterService,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, HeaderMap, bytes::Bytes) {
     let req = request_builder()
-        .method("POST")
+        .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build POST request");
+        .expect("should build request");
     let resp = router.oneshot(req).await.expect("should respond");
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
@@ -185,13 +251,23 @@ async fn spin_get(uri: &str) -> (u16, HeaderMap) {
 
 /// Send a POST request to the Spin adapter and return (status, headers, body bytes).
 async fn spin_post(uri: &str, body: &str) -> (u16, HeaderMap, bytes::Bytes) {
-    let router = spin_router();
+    spin_send(spin_router(), "POST", uri, body).await
+}
+
+/// Send a JSON request to the Spin `router` and return
+/// (status, headers, body bytes).
+async fn spin_send(
+    router: RouterService,
+    method: &str,
+    uri: &str,
+    body: &str,
+) -> (u16, HeaderMap, bytes::Bytes) {
     let req = request_builder()
-        .method("POST")
+        .method(method)
         .uri(uri)
         .header("content-type", "application/json")
         .body(edgezero_core::body::Body::from(body.to_owned()))
-        .expect("should build POST request");
+        .expect("should build request");
     let resp = router.oneshot(req).await.expect("should respond");
     let status = resp.status().as_u16();
     let headers = resp.headers().clone();
@@ -791,6 +867,71 @@ async fn spin_auction_ignores_spoofed_forwarded_headers() {
         "spoofed forwarded headers must not change Spin /auction behaviour: \
          clean={clean_status} spoofed={spoofed_status}"
     );
+}
+
+const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
+    ("GET", "/first-party/proxy"),
+    ("GET", "/first-party/sign"),
+    ("POST", "/first-party/sign"),
+    ("GET", "/first-party/click"),
+    ("GET", "/first-party/proxy-rebuild"),
+    ("POST", "/first-party/proxy-rebuild"),
+    ("POST", "/auction"),
+];
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turned_off_endpoints_parity() {
+    let axum = axum_router_with(turned_off_settings());
+    let cf = cf_router_with(turned_off_settings());
+    let spin = spin_router_with(turned_off_settings());
+
+    for (method, path) in TURNED_OFF_REQUESTS {
+        let label = format!("{method} {path}");
+        let (axum_status, axum_headers, axum_body) =
+            axum_send(axum.clone(), method, path, "").await;
+        let (cf_status, cf_headers, cf_body) = cf_send(cf.clone(), method, path, "").await;
+        let (spin_status, spin_headers, spin_body) =
+            spin_send(spin.clone(), method, path, "").await;
+
+        for (adapter, status, headers, body) in [
+            ("Axum", axum_status, &axum_headers, &axum_body),
+            ("Cloudflare", cf_status, &cf_headers, &cf_body),
+            ("Spin", spin_status, &spin_headers, &spin_body),
+        ] {
+            assert_eq!(
+                status, 404,
+                "{adapter} {label}: should answer 404 while turned off"
+            );
+            assert_eq!(
+                headers
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, private"),
+                "{adapter} {label}: should keep the turned-off answer out of every cache"
+            );
+            assert_eq!(
+                body.as_ref(),
+                ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+                "{adapter} {label}: should answer the turned-off body"
+            );
+        }
+        assert_eq!(
+            axum_status, cf_status,
+            "{label}: status must match across adapters: axum={axum_status} cf={cf_status}"
+        );
+        assert_eq!(
+            cf_status, spin_status,
+            "{label}: status must match across adapters: cf={cf_status} spin={spin_status}"
+        );
+        assert_eq!(
+            axum_body, cf_body,
+            "{label}: body must match across adapters (axum vs cf)"
+        );
+        assert_eq!(
+            cf_body, spin_body,
+            "{label}: body must match across adapters (cf vs spin)"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

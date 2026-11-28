@@ -10,6 +10,7 @@ use edgezero_adapter_axum::service::EdgeZeroAxumService;
 use std::sync::Arc;
 use tower::{Service as _, ServiceExt as _};
 use trusted_server_adapter_axum::app::TrustedServerApp;
+use trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY;
 use trusted_server_core::test_support::nextjs_auction;
 
 const LEGACY_ADMIN_DENY_METHODS: &[&str] =
@@ -36,6 +37,9 @@ fn test_settings() -> trusted_server_core::settings::Settings {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [auction]
+            enabled = true
         "#,
     )
     .expect("should parse route test settings")
@@ -868,6 +872,87 @@ async fn first_party_proxy_rebuild_is_routed() {
         404,
         "/first-party/proxy-rebuild must be routed"
     );
+}
+
+const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
+    ("GET", "/first-party/proxy"),
+    ("GET", "/first-party/sign"),
+    ("POST", "/first-party/sign"),
+    ("GET", "/first-party/click"),
+    ("GET", "/first-party/proxy-rebuild"),
+    ("POST", "/first-party/proxy-rebuild"),
+    ("POST", "/auction"),
+];
+
+/// Build route test settings with the auction and creative rewriting off.
+fn turned_off_settings() -> trusted_server_core::settings::Settings {
+    trusted_server_core::settings::Settings::from_toml(
+        r#"
+            [[handlers]]
+            path = "^/_ts/admin"
+            username = "admin"
+            password = "admin-pass"
+
+            [publisher]
+            domain = "test-publisher.example.com"
+            cookie_domain = ".test-publisher.example.com"
+            origin_url = "https://origin.test-publisher.example.com"
+            proxy_secret = "integration-test-proxy-secret"
+
+            [ec]
+            passphrase = "test-secret-key-32-bytes-minimum"
+
+            [auction]
+            enabled = false
+            rewrite_creatives = false
+        "#,
+    )
+    .expect("should parse turned-off route test settings")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turned_off_endpoints_answer_404_locally() {
+    let router = TrustedServerApp::routes_with_settings(turned_off_settings())
+        .expect("should build router with the endpoints turned off");
+    let mut svc = EdgeZeroAxumService::new(router);
+
+    for (method, path) in TURNED_OFF_REQUESTS {
+        let label = format!("{method} {path}");
+        let req = Request::builder()
+            .method(*method)
+            .uri(*path)
+            .body(AxumBody::empty())
+            .expect("should build turned-off request");
+
+        let resp = svc
+            .ready()
+            .await
+            .expect("should be ready")
+            .call(req)
+            .await
+            .expect("should respond");
+
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "{label}: should answer 404 while turned off"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "{label}: should keep the turned-off answer out of every cache"
+        );
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .expect("should read the turned-off body");
+        assert_eq!(
+            body.as_ref(),
+            ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+            "{label}: should answer the turned-off body"
+        );
+    }
 }
 
 /// Regression test: a Next.js navigation with a pending auction must buffer to

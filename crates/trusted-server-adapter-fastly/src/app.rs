@@ -2854,6 +2854,57 @@ mod tests {
         );
     }
 
+    const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
+        ("GET", "/first-party/proxy"),
+        ("GET", "/first-party/sign"),
+        ("POST", "/first-party/sign"),
+        ("GET", "/first-party/click"),
+        ("GET", "/first-party/proxy-rebuild"),
+        ("POST", "/first-party/proxy-rebuild"),
+        ("POST", "/auction"),
+    ];
+
+    #[test]
+    fn turned_off_endpoints_answer_404_locally() {
+        let mut settings = test_settings();
+        settings.auction.enabled = false;
+        settings.auction.rewrite_creatives = false;
+        let state = build_state_from_settings(settings)
+            .expect("should build state with the endpoints turned off");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        for (method, path) in TURNED_OFF_REQUESTS {
+            let label = format!("{method} {path}");
+            let request_method =
+                Method::from_bytes(method.as_bytes()).expect("should parse request method");
+
+            let response = route(&router, empty_request(request_method, path));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{label}: should answer 404 while turned off"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, private"),
+                "{label}: should keep the turned-off answer out of every cache"
+            );
+            let body = response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_else(|| panic!("{label}: should buffer the turned-off body"));
+            assert_eq!(
+                body.as_ref(),
+                trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+                "{label}: should answer the turned-off body"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_unregistered_method_returns_405_at_router_level() {
         // Documents the known router-level behavior for verbs outside the
