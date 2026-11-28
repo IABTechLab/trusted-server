@@ -17,13 +17,18 @@ Prepare an amd64 Linux Rust/Node builder image with repository-pinned Rust
 local image ID as `BUILDER_IMAGE`. Build from a clean committed checkout through
 `git archive`; this freezes the worker's source at `/source`, including its
 compile-time `CARGO_MANIFEST_DIR`. The final image pins Playwright 1.58.2's Noble
-image, installs NSS tooling, stages the lockfile-built bidder-only Prebid bundle
-and pinned PUC, and verifies the native worker's ELF dependencies and test entry.
+image by its enforced manifest digest, installs NSS tooling, stages the lockfile-built bidder-only Prebid bundle
+and pinned PUC, and verifies the native worker's ELF dependencies and test entry. Supply the
+qualified Linux amd64 Noble image reference in `PLAYWRIGHT_IMAGE`, including
+its `@sha256:` manifest digest. See the official [Playwright Docker
+documentation](https://playwright.dev/docs/docker) for its image source; the
+Dockerfile refuses a different digest or a mutable tag.
 
 ```bash
 test -z "$(git status --porcelain)"
 git archive HEAD | docker build --platform linux/amd64 \
   --build-arg "BUILDER_IMAGE=$BUILDER_IMAGE" \
+  --build-arg "PLAYWRIGHT_IMAGE=$PLAYWRIGHT_IMAGE" \
   --build-arg "HARNESS_COMMIT=$(git rev-parse HEAD)" \
   --iidfile /tmp/example-worker-image \
   -f crates/trusted-server-integration-tests/fixtures/auctioneer/Dockerfile -

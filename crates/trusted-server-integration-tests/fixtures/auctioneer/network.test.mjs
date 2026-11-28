@@ -1,6 +1,13 @@
 import { test } from 'node:test'
+import { spawnSync } from 'node:child_process'
 import assert from 'node:assert/strict'
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { digest, validateArtifacts, verifyTopology } from './network.mjs'
@@ -118,5 +125,107 @@ test('refuses mismatched artifact bytes, source, features and native platform', 
     assert.throws(() => validateArtifacts(input, root), /x86_64/)
   } finally {
     rmSync(root, { recursive: true })
+  }
+})
+
+test('cleans an owned container when create succeeds remotely but the client fails', () => {
+  const root = mkdtempSync(join(tmpdir(), 'example-rpc-failure-'))
+  try {
+    const wasm = join(root, 'guest.wasm')
+    writeFileSync(wasm, Buffer.from([0, 97, 115, 109, 1, 0, 0, 0]))
+    const cli = join(root, 'ts')
+    const elf = Buffer.alloc(20)
+    elf.set([127, 69, 76, 70, 2, 1])
+    elf.writeUInt16LE(62, 18)
+    writeFileSync(cli, elf)
+    chmodSync(cli, 0o755)
+    const source = 'a'.repeat(40)
+    const identity = join(root, 'inputs.json')
+    writeFileSync(
+      identity,
+      JSON.stringify({
+        productCommit: source,
+        variant: 'default',
+        profile: 'release',
+        testUtils: false,
+        producer: 'scripts/release/phase1-build.sh',
+        wasm: { path: wasm, sha256: digest(wasm), sourceCommit: source },
+        cli: { path: cli, sha256: digest(cli), sourceCommit: source },
+      })
+    )
+    const log = join(root, 'calls.jsonl')
+    const fake = join(root, 'docker')
+    writeFileSync(
+      fake,
+      `#!/usr/bin/env node
+const fs = require('node:fs')
+const args = process.argv.slice(2)
+fs.appendFileSync(process.env.FIXTURE_DOCKER_LOG, JSON.stringify(args) + '\\n')
+if (args[0] === 'image') process.stdout.write(JSON.stringify([{ Os: 'linux', Architecture: 'amd64', Config: { Labels: { 'org.opencontainers.image.revision': 'a'.repeat(40) } } }]))
+if (args[0] === 'create') { process.stderr.write('Simulated lost create reply'); process.exit(1) }
+`
+    )
+    chmodSync(fake, 0o755)
+    const result = spawnSync(
+      process.execPath,
+      [
+        new URL('./network.mjs', import.meta.url).pathname,
+        '--image',
+        'sha256:' + 'd'.repeat(64),
+        '--artifacts',
+        identity,
+        '--out',
+        join(root, 'evidence'),
+      ],
+      {
+        env: {
+          ...process.env,
+          PATH: root + ':' + process.env.PATH,
+          FIXTURE_DOCKER_LOG: log,
+        },
+        encoding: 'utf8',
+      }
+    )
+    assert.notEqual(
+      result.status,
+      0,
+      'should preserve the failed production run'
+    )
+    assert.match(result.stderr, /Simulated lost create reply/)
+    const calls = readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse)
+    const create = calls.find((args) => args[0] === 'create')
+    const name = create[create.indexOf('--name') + 1]
+    assert(
+      calls.some((args) => args[0] === 'rm' && args.at(-1) === name),
+      'should attempt removal after an uncertain create result'
+    )
+    assert(
+      calls.some((args) => args[0] === 'network' && args[1] === 'rm'),
+      'should still remove the owned network'
+    )
+  } finally {
+    rmSync(root, { recursive: true })
+  }
+})
+
+test('runtime image input requires the qualified immutable manifest digest', () => {
+  const source = readFileSync(new URL('./Dockerfile', import.meta.url), 'utf8')
+  const fragment = source.match(
+    /RUN (case "\$PLAYWRIGHT_IMAGE" in [\s\S]*?esac)/
+  )?.[1]
+  assert(fragment, 'should enforce the qualified runtime image digest')
+  const command = fragment.replaceAll('\\\n', ' ')
+  const qualified =
+    '65cefd09a5e943921ecd3a6e5414c603db2eb161e9eb48f2e2ccc63486dc7dc0'
+  for (const [reference, expected] of [
+    [`registry.example.com/fixture@sha256:${qualified}`, 0],
+    [`sha256:${qualified}`, 1],
+    ['registry.example.com/fixture:latest', 1],
+    [`registry.example.com/fixture@sha256:${'0'.repeat(64)}`, 1],
+  ]) {
+    const result = spawnSync('/bin/sh', ['-c', command], {
+      env: { PLAYWRIGHT_IMAGE: reference },
+    })
+    assert.equal(result.status, expected, reference)
   }
 })

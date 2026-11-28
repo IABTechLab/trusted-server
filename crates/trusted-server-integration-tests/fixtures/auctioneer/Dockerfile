@@ -1,6 +1,7 @@
 # Build from a clean git archive, with a qualified Linux Rust/Node build image.
 # No Docker socket is present in this worker image or its runtime container.
 ARG BUILDER_IMAGE
+ARG PLAYWRIGHT_IMAGE
 FROM ${BUILDER_IMAGE} AS builder
 USER root
 ARG HARNESS_COMMIT
@@ -17,7 +18,12 @@ RUN node -e 'const fs=require("fs");const rows=fs.readFileSync("/tmp/worker-buil
 RUN rm -rf crates/trusted-server-js/lib/node_modules
 RUN curl -fsSL https://github.com/fastly/Viceroy/releases/download/v0.22.0/viceroy_v0.22.0_linux-amd64.tar.gz -o /tmp/viceroy.tar.gz && echo '03f66f27275e8adc0c1857c4f571bd6f5ae997e38cc43760b19c6840a92b298d  /tmp/viceroy.tar.gz' | sha256sum -c - && tar -xzf /tmp/viceroy.tar.gz -C /opt viceroy
 
-FROM mcr.microsoft.com/playwright:v1.58.2-noble@sha256:65cefd09a5e943921ecd3a6e5414c603db2eb161e9eb48f2e2ccc63486dc7dc0
+FROM ${PLAYWRIGHT_IMAGE}
+ARG PLAYWRIGHT_IMAGE
+RUN case "$PLAYWRIGHT_IMAGE" in \
+      *@sha256:65cefd09a5e943921ecd3a6e5414c603db2eb161e9eb48f2e2ccc63486dc7dc0) ;; \
+      *) exit 1 ;; \
+    esac
 USER root
 ARG HARNESS_COMMIT
 LABEL org.opencontainers.image.revision=${HARNESS_COMMIT}

@@ -215,8 +215,8 @@ async function main() {
       )
     }
     args.push(values.image)
-    await docker(args)
     containerCreated = true
+    await docker(args)
     const container = JSON.parse(await docker(['inspect', name]))[0]
     const topology = JSON.parse(
       await docker(['network', 'inspect', network])
@@ -299,10 +299,13 @@ async function main() {
     )
   } finally {
     const cleanupErrors = []
+    let containerRemoved = !containerCreated
+    let networkRemoved = !networkCreated
     try {
       if (containerCreated) {
         try {
           await docker(['rm', '--force', name])
+          containerRemoved = true
         } catch (error) {
           cleanupErrors.push(error)
         }
@@ -310,6 +313,7 @@ async function main() {
       if (networkCreated) {
         try {
           await docker(['network', 'rm', network])
+          networkRemoved = true
         } catch (error) {
           cleanupErrors.push(error)
         }
@@ -322,7 +326,8 @@ async function main() {
       join(out, 'cleanup.json'),
       JSON.stringify(
         {
-          containerRemoved: !containerCreated || !cleanupErrors.length,
+          containerRemoved,
+          networkRemoved,
           errors: cleanupErrors.map((error) => error.message),
         },
         null,

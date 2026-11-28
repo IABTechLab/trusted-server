@@ -519,6 +519,24 @@ pub(super) fn run() -> HarnessResult<()> {
             "should observe verified original bidder Host/SNI and no rejected-TLS HTTP receipts",
         ));
     }
+    for (path, host) in [
+        ("/external-prebid.js", "assets.example.com:18443"),
+        ("/fixture-puc", "creative.example.com:18443"),
+        ("/fixture-puc.js", "creative.example.com:18443"),
+        ("/creative-asset.svg", "creative.example.com:18443"),
+    ] {
+        if !receipts.iter().any(|receipt| {
+            receipt["port"] == 18443
+                && receipt["host"] == host
+                && receipt["path"]
+                    .as_str()
+                    .is_some_and(|target| target.split('?').next() == Some(path))
+        }) {
+            return Err(Report::new(HarnessError::Runtime).attach(format!(
+                "should observe the declared HTTPS asset stage: {host}{path}"
+            )));
+        }
+    }
     fs::write("/results/worker.json", json!({"mode":"production-pbs-baseline","auctioneerAcceptance":false,"tlsNegativeCases":["wrong-san","untrusted-ca"],"listeners":listeners,"prebid":serde_json::from_slice::<Value>(&fs::read("/inputs/prebid/manifest.json").change_context(HarnessError::Io)?).change_context(HarnessError::Configuration)?}).to_string()).change_context(HarnessError::Io)?;
     worker.run(
         worker.command("sha256sum").args([
