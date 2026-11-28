@@ -589,10 +589,9 @@ impl AuctionOrchestrator {
             })
             .collect::<HashMap<_, _>>();
         let planned_unroutable_bidder_count = routed.diagnostics().unroutable_bidder_count();
-        // A zero request budget is terminal before signing admission. In the
-        // split path, signer initialization would otherwise read config and
-        // secret stores even though every provider is materialized as timeout.
-        let signer_result = if context.timeout_ms == 0 {
+        // A zero budget or empty routed demand cannot produce a signed request.
+        // Avoid loading config and secrets for these terminal no-work outcomes.
+        let signer_result = if context.timeout_ms == 0 || routed.inputs().is_empty() {
             Ok(None)
         } else {
             plan.signing_enabled()
@@ -3573,6 +3572,108 @@ mod tests {
             assert!(result.metadata.contains_key("routing"));
             assert!(recorded_uris(&http).is_empty());
         }
+    }
+
+    async fn assert_signed_skipped_auction_avoids_key_reads(split: bool) {
+        let config_store = Arc::new(FailingCountingConfigStore {
+            reads: AtomicUsize::new(0),
+        });
+        let secret_store = Arc::new(CountingSecretStore {
+            reads: AtomicUsize::new(0),
+            key: Vec::new(),
+        });
+        let clock = TestClock::new();
+        let http = ScriptedHttpClient::new(&clock);
+        let services = RuntimeServices::builder()
+            .config_store(Arc::clone(&config_store) as Arc<_>)
+            .secret_store(Arc::clone(&secret_store) as Arc<_>)
+            .kv_store(Arc::new(edgezero_core::key_value_store::NoopKvStore))
+            .outbound_client(http.http_client())
+            .clock(clock.monotonic_clock())
+            .geo(Arc::new(crate::platform::test_support::NoopGeo))
+            .auction_telemetry_sink(Arc::new(
+                crate::auction::telemetry::NoopAuctionTelemetrySink,
+            ))
+            .client_info(crate::platform::ClientInfo::default())
+            .build();
+        let plan = Arc::new(
+            AuctionPlan::compile(planned_config(&[("skipped", RoutingMode::Explicit)], true))
+                .expect("should compile a signed plan with no routed demand"),
+        );
+        let orchestrator = AuctionOrchestrator::from_plan(plan, None);
+        let settings = create_test_settings();
+        let inbound = http::Request::new(edgezero_core::body::Body::empty());
+        let context = AuctionContext {
+            settings: &settings,
+            request: &inbound,
+            timeout_ms: 777,
+            provider_responses: None,
+            services: &services,
+        };
+        let request = planned_request();
+
+        let result = if split {
+            let DispatchAuctionOutcome::Dispatched(dispatched) =
+                orchestrator.dispatch_auction(&request, &context).await
+            else {
+                panic!("should complete all-skipped signed dispatch without loading keys");
+            };
+            orchestrator
+                .collect_dispatched_auction(dispatched, &services, &context)
+                .await
+        } else {
+            orchestrator
+                .run_auction(&request, &context)
+                .await
+                .expect("should complete an all-skipped signed auction without loading keys")
+        };
+
+        assert_eq!(
+            result.provider_responses.len(),
+            1,
+            "should retain the skipped provider"
+        );
+        assert_eq!(
+            result.provider_responses[0].status,
+            BidStatus::NoBid,
+            "should preserve the no-bid outcome"
+        );
+        assert_eq!(
+            result.provider_responses[0].metadata["routing"]["skipped_no_eligible_slots"], true,
+            "should retain skip attribution"
+        );
+        assert!(
+            result.metadata.contains_key("routing"),
+            "should retain routing diagnostics"
+        );
+        assert!(
+            result.winning_bids.is_empty(),
+            "should have no winning bids"
+        );
+        assert_eq!(
+            config_store.reads.load(Ordering::Relaxed),
+            0,
+            "should not read signing configuration without demand"
+        );
+        assert_eq!(
+            secret_store.reads.load(Ordering::Relaxed),
+            0,
+            "should not read signing secrets without demand"
+        );
+        assert!(
+            recorded_uris(&http).is_empty(),
+            "should not start HTTP work without demand"
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_skipped_auction_avoids_key_reads_in_direct_path() {
+        assert_signed_skipped_auction_avoids_key_reads(false).await;
+    }
+
+    #[tokio::test]
+    async fn signed_skipped_auction_avoids_key_reads_in_split_path() {
+        assert_signed_skipped_auction_avoids_key_reads(true).await;
     }
 
     struct FailingCountingConfigStore {
