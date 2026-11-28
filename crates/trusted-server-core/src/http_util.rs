@@ -3,7 +3,7 @@ use chacha20poly1305::{XChaCha20Poly1305, XNonce, aead::Aead as _, aead::KeyInit
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::ingress::{InboundOrigin, RequestIngress};
 use error_stack::Report;
-use http::{Request, Response, StatusCode, header};
+use http::{HeaderValue, Request, Response, StatusCode, header};
 use sha2::{Digest as _, Sha256};
 use std::net::Ipv6Addr;
 use std::time::Duration;
@@ -14,6 +14,7 @@ use crate::constants::INTERNAL_HEADERS;
 use crate::error::TrustedServerError;
 use crate::forwarder::public_origin;
 use crate::platform::ClientInfo;
+use crate::response_privacy::enforce_terminal_private_cache_privacy;
 use crate::settings::{Settings, TrustedClientIpConfig};
 
 /// Copy `X-*` custom headers from one request to another, skipping TS-internal headers.
@@ -505,6 +506,36 @@ pub fn enforce_max_body_size(
         }));
     }
     Ok(())
+}
+
+/// Body of the local `404` an endpoint answers while its switch is off.
+///
+/// [`endpoint_turned_off_response`] sends it; adapter and parity tests compare
+/// against it.
+pub const ENDPOINT_TURNED_OFF_BODY: &str = "This endpoint is turned off";
+
+/// Build the local `404` an endpoint answers while the switch that runs it is off.
+///
+/// The response carries [`ENDPOINT_TURNED_OFF_BODY`] as
+/// `text/plain; charset=utf-8` with `Cache-Control: no-store, private`, and the
+/// [`TerminalPrivateResponse`](crate::response_privacy::TerminalPrivateResponse)
+/// marker so the platform send boundary restores that policy after late header
+/// changes. Handlers return it as `Ok`: a turned-off endpoint is configuration,
+/// not a failure.
+///
+/// Writes one debug line naming `endpoint` (its path) and `switch` (the
+/// setting that turns it on).
+#[must_use]
+pub fn endpoint_turned_off_response(endpoint: &str, switch: &str) -> Response<EdgeBody> {
+    log::debug!("answering {endpoint} locally with 404 because {switch} is off");
+    let mut response = Response::new(EdgeBody::from(ENDPOINT_TURNED_OFF_BODY));
+    *response.status_mut() = StatusCode::NOT_FOUND;
+    response.headers_mut().insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; charset=utf-8"),
+    );
+    enforce_terminal_private_cache_privacy(&mut response);
+    response
 }
 
 #[cfg(test)]

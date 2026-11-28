@@ -10,6 +10,7 @@ use edgezero_core::app::Hooks as _;
 use edgezero_core::http::{Request, Response, request_builder};
 use edgezero_core::router::RouterService;
 use trusted_server_adapter_spin::app::TrustedServerApp;
+use trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY;
 use trusted_server_core::settings::Settings;
 
 /// Build the full application router from explicit test settings.
@@ -21,7 +22,13 @@ use trusted_server_core::settings::Settings;
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// Shared route test settings behind [`test_router`].
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -36,12 +43,12 @@ fn test_router() -> RouterService {
 
             [ec]
             passphrase = "test-secret-key-32-bytes-minimum"
+
+            [auction]
+            enabled = true
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
 async fn route(router: RouterService, req: Request) -> Response {
@@ -722,6 +729,65 @@ async fn first_party_proxy_rebuild_get_is_routed() {
         404,
         "GET /first-party/proxy-rebuild must be routed"
     );
+}
+
+const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
+    ("GET", "/first-party/proxy"),
+    ("GET", "/first-party/sign"),
+    ("POST", "/first-party/sign"),
+    ("GET", "/first-party/click"),
+    ("GET", "/first-party/proxy-rebuild"),
+    ("POST", "/first-party/proxy-rebuild"),
+    ("POST", "/auction"),
+];
+
+/// Build a router from [`test_settings`] with the auction and creative
+/// rewriting off.
+fn turned_off_router() -> RouterService {
+    let mut settings = test_settings();
+    settings.auction.enabled = false;
+    settings.auction.rewrite_creatives = false;
+
+    TrustedServerApp::routes_with_settings(settings)
+        .expect("should build router with the endpoints turned off")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn turned_off_endpoints_answer_404_locally() {
+    let router = turned_off_router();
+
+    for (method, path) in TURNED_OFF_REQUESTS {
+        let label = format!("{method} {path}");
+        let req = request_builder()
+            .method(*method)
+            .uri(*path)
+            .body(edgezero_core::body::Body::empty())
+            .expect("should build turned-off request");
+
+        let resp = route(router.clone(), req).await;
+
+        assert_eq!(
+            resp.status().as_u16(),
+            404,
+            "{label}: should answer 404 while turned off"
+        );
+        assert_eq!(
+            resp.headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "{label}: should keep the turned-off answer out of every cache"
+        );
+        let body = resp
+            .into_body()
+            .into_bytes()
+            .unwrap_or_else(|| panic!("{label}: should buffer the turned-off body"));
+        assert_eq!(
+            body.as_ref(),
+            ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+            "{label}: should answer the turned-off body"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

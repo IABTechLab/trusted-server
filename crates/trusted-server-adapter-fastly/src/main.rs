@@ -1382,6 +1382,50 @@ mod tests {
         assert!(response.headers().get("cdn-cache-control").is_none());
     }
 
+    #[test]
+    fn late_filter_effects_cannot_make_a_turned_off_response_public() {
+        let mut response = trusted_server_core::http_util::endpoint_turned_off_response(
+            "/auction",
+            "auction.enabled",
+        );
+        let effects = RequestFilterEffects {
+            request_headers: Vec::new(),
+            response_headers: vec![
+                HeaderMutation::set("cache-control", "public, s-maxage=3600"),
+                HeaderMutation::set("surrogate-control", "max-age=3600"),
+                HeaderMutation::set("cdn-cache-control", "public, max-age=3600"),
+            ],
+        };
+
+        apply_terminal_response_effects(&mut response, Some(&effects));
+
+        assert_eq!(
+            response
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "should restore the turned-off cache policy after late filter effects"
+        );
+        assert!(
+            response.headers().get("surrogate-control").is_none(),
+            "should drop a late surrogate-control on a turned-off response"
+        );
+        assert!(
+            response.headers().get("cdn-cache-control").is_none(),
+            "should drop a late cdn-cache-control on a turned-off response"
+        );
+        let body = response
+            .into_body()
+            .into_bytes()
+            .expect("should keep the turned-off body buffered");
+        assert_eq!(
+            body.as_ref(),
+            trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+            "should leave the turned-off body unchanged"
+        );
+    }
+
     fn diagnostics_settings() -> Settings {
         Settings::from_toml(
             r#"

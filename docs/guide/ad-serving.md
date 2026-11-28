@@ -16,7 +16,8 @@ publisher proxy path.
 `[auction].enabled = true`, the compiled `AuctionPlan` selects configured
 providers, routes bidder codes, executes supported provider fan-out, applies an
 optional mediator, and returns the winning bids. When auctions are disabled,
-the endpoint returns a no-bid response without contacting a provider.
+the endpoint returns a local `404` without contacting a provider; see
+[`POST /auction`](/guide/api-reference#post-auction).
 
 ## Shipped demand and mediation
 

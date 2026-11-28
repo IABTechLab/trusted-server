@@ -2305,7 +2305,7 @@ provider or bidder route.
 
 | Field                  | Type    | Default            | Description                                                                                                  |
 | ---------------------- | ------- | ------------------ | ------------------------------------------------------------------------------------------------------------ |
-| `enabled`              | Boolean | `false`            | Enable the auction orchestrator                                                                              |
+| `enabled`              | Boolean | `false`            | Enable the auction orchestrator and `POST /auction`                                                          |
 | `sanitize_creatives`   | Boolean | `false`            | Strip executable markup from winning-bid `adm` before delivery                                               |
 | `rewrite_creatives`    | Boolean | `true`             | Rewrite winning-bid asset URLs through first-party endpoints                                                 |
 | `rewrite_clicks`       | Boolean | unset              | Wrap creative links in `/first-party/click`; unset follows `rewrite_creatives` (proxied HTML keeps wrapping) |
@@ -2338,10 +2338,35 @@ bundle. With all three disabled,
 `adm` ships exactly as the bidder returned it, except that a creative larger than the
 1 MiB per-creative cap is rejected in every mode and its `adm` is dropped.
 Accepted external URLs are not host allowlisted by the sanitizer.
-`rewrite_creatives` and `sanitize_creatives` do not affect HTML or CSS fetched
-through `/first-party/proxy`. An explicitly set `rewrite_clicks` does apply to
-links in proxied HTML; unset, proxied HTML keeps wrapping links. See
+HTML and CSS fetched through `/first-party/proxy` are rewritten only while that
+endpoint is on, which needs `rewrite_creatives = true`; `sanitize_creatives`
+does not affect them. An explicitly set `rewrite_clicks` does apply to links in
+proxied HTML; unset, proxied HTML keeps wrapping links. See
 [Creative Processing](/guide/creative-processing#auction-rewrite-control).
+
+These switches also decide which endpoints answer:
+
+| Endpoint                                 | Answers while                                                                      |
+| ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `POST /auction`                          | `enabled = true`                                                                   |
+| `GET /first-party/proxy`                 | `rewrite_creatives = true`                                                         |
+| `GET`, `POST /first-party/sign`          | `rewrite_creatives = true`                                                         |
+| `GET /first-party/click`                 | `rewrite_clicks = true`, or `rewrite_creatives = true` with `rewrite_clicks` unset |
+| `GET`, `POST /first-party/proxy-rebuild` | same as `/first-party/click`                                                       |
+
+A turned-off endpoint returns `404` with `Cache-Control: no-store, private`;
+see [Route availability](/guide/api-reference#route-availability). The default
+creative switches keep all four creative endpoints on, and `enabled = false`,
+the default, turns `POST /auction` off.
+
+::: warning Turning a switch off breaks creatives already on a page
+Creatives already on a page keep their rewritten URLs. Once `rewrite_creatives`
+is turned off, they stop loading proxied assets. Once click wrapping is turned
+off, their links land on the `404` instead of the advertiser. Pages cached
+before `enabled` was turned off still call `POST /auction` and get the `404`
+until they expire. Publisher code that calls `tsjs.requestAds` keeps calling
+`POST /auction` from fresh pages too, and gets the same `404`.
+:::
 
 ::: warning Existing configs, upgrade sequencing, and rollback
 Default values are omitted from stored JSON; non-default values
@@ -2366,7 +2391,9 @@ in both directions: rolling back from `rewrite_creatives = true` with
 `rewrite_clicks = false` turns click wrapping back on, and rolling back from
 `rewrite_creatives = false` with `rewrite_clicks = true` turns it off. Rolling
 back from any `rewrite_clicks = false` also turns click wrapping back on in HTML
-fetched through `/first-party/proxy`.
+fetched through `/first-party/proxy`. Binaries that predate the endpoint
+switches keep every creative endpoint on whatever the switches say, and answer
+`POST /auction` with a `200` no-bid response while `enabled = false`.
 
 **Environment overlays:** The pinned EdgeZero loader cannot create missing TOML
 leaves. Existing configs must add **both** leaves under `[auction]`
@@ -2379,8 +2406,9 @@ cannot appear as a TOML leaf until you set it; add `rewrite_clicks = true` or
 `TRUSTED_SERVER__AUCTION__REWRITE_CLICKS`. The leaf only preserves today's
 behavior when it matches what unset resolves to: with `rewrite_creatives =
 true`, `rewrite_clicks = true` does, but with `rewrite_creatives = false` no
-value does (`true` wraps auction links, `false` stops wrapping links in HTML
-fetched through `/first-party/proxy`).
+value does. `true` wraps auction links. `false` stops wrapping links in HTML
+that a non-streaming integration proxy, such as Google Tag Manager, still
+rewrites; `/first-party/proxy` itself is off in that state.
 :::
 
 ### Provider map

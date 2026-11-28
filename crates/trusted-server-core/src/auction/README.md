@@ -31,14 +31,15 @@ in `auction::endpoints`, so no provider or profile depends on Fastly types.
 
 `handle_auction` performs these steps:
 
-1. Enforce the body limit and parse the Trusted Server ad-unit request.
-2. Apply the disabled-auction and consent gates before provider work.
-3. Consume the request's existing EC and consent context. The endpoint does not
+1. Answer the turned-off `404` while the auction is off, before any other work.
+2. Enforce the body limit and parse the Trusted Server ad-unit request.
+3. Apply the consent gate before provider work.
+4. Consume the request's existing EC and consent context. The endpoint does not
    generate an EC ID.
-4. Convert the request with `convert_tsjs_to_auction_request`.
-5. Route slots and bidder params through the compiled `AuctionPlan`.
-6. Run the plan-backed orchestrator and optional mediator.
-7. Build the OpenRTB response with `convert_to_openrtb_response`.
+5. Convert the request with `convert_tsjs_to_auction_request`.
+6. Route slots and bidder params through the compiled `AuctionPlan`.
+7. Run the plan-backed orchestrator and optional mediator.
+8. Build the OpenRTB response with `convert_to_openrtb_response`.
 
 ## Configuration boundary
 

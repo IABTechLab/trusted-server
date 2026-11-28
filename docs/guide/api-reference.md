@@ -32,44 +32,53 @@ authority, scheme, and client-address headers in the innermost middleware.
 
 ## Route availability
 
-| Router  | Path                                   | Methods                                                    | Shape          | Predicate                             | Fastly                | Axum                  | Cloudflare            | Spin                  |
-| ------- | -------------------------------------- | ---------------------------------------------------------- | -------------- | ------------------------------------- | --------------------- | --------------------- | --------------------- | --------------------- |
-| normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                              | real                  | unsupported           | unsupported           | unsupported           |
-| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                              | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled` | real                  | —                     | —                     | —                     |
-| normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`      | real                  | —                     | —                     | —                     |
-| normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                              | guarded               | guarded               | guarded               | guarded               |
-| normal  | `/auction`                             | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/first-party/click`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/first-party/proxy`                   | `GET`                                                      | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/first-party/sign`                    | `GET`, `POST`                                              | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/health`                              | `GET`                                                      | literal        | `always`                              | real                  | real                  | —                     | real                  |
-| normal  | `/static/tsjs=<file>`                  | `GET`                                                      | template       | `path.starts_with(/static/tsjs=)`     | real                  | real                  | real                  | real                  |
-| normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                              | real                  | real                  | real                  | real                  |
-| normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
-| normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                  | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
-| normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`       | real                  | —                     | —                     | —                     |
-| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                       | real                  | —                     | —                     | real                  |
-| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
-| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                       | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| Router  | Path                                   | Methods                                                    | Shape          | Predicate                                    | Fastly                | Axum                  | Cloudflare            | Spin                  |
+| ------- | -------------------------------------- | ---------------------------------------------------------- | -------------- | -------------------------------------------- | --------------------- | --------------------- | --------------------- | --------------------- |
+| normal  | `/.well-known/trusted-server.json`     | `GET`                                                      | literal        | `always`                                     | real                  | real                  | real                  | real                  |
+| normal  | `/__ts/page-bids`                      | `GET`                                                      | literal        | `always`                                     | real                  | real                  | real                  | real                  |
+| normal  | `/__ts/page-bids`                      | `OPTIONS`                                                  | literal        | `always`                                     | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/_ts/admin/ec/{id}`                   | `GET`                                                      | template       | `always`                                     | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/ec`                        | `GET`                                                      | literal        | `always`                                     | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/eids`                      | `GET`                                                      | literal        | `always`                                     | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/admin/keys/deactivate`           | `POST`                                                     | literal        | `always`                                     | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/admin/keys/rotate`               | `POST`                                                     | literal        | `always`                                     | real                  | unsupported           | unsupported           | unsupported           |
+| normal  | `/_ts/api/v1/batch-sync`               | `POST`                                                     | literal        | `always`                                     | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/api/v1/identify`                 | `GET`, `OPTIONS`                                           | literal        | `always`                                     | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/clear-tester`                    | `GET`                                                      | literal        | `settings.tester_cookie.enabled`             | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/debug/ja4`                       | `GET`                                                      | conditional    | `settings.debug.ja4_endpoint_enabled`        | real                  | —                     | —                     | —                     |
+| normal  | `/_ts/page-bids`                       | `GET`                                                      | literal        | `always`                                     | real                  | real                  | real                  | real                  |
+| normal  | `/_ts/page-bids`                       | `OPTIONS`                                                  | literal        | `always`                                     | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/_ts/set-tester`                      | `GET`                                                      | literal        | `settings.tester_cookie.enabled`             | real                  | —                     | —                     | —                     |
+| normal  | `/admin/keys/deactivate`               | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                                     | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/admin/keys/rotate`                   | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `always`                                     | guarded               | guarded               | guarded               | guarded               |
+| normal  | `/auction`                             | `POST`                                                     | literal        | `settings.auction.enabled`                   | real                  | real                  | real                  | real                  |
+| normal  | `/first-party/click`                   | `GET`                                                      | literal        | `settings.auction.rewrites_auction_clicks()` | real                  | real                  | real                  | real                  |
+| normal  | `/first-party/proxy-rebuild`           | `GET`, `POST`                                              | literal        | `settings.auction.rewrites_auction_clicks()` | real                  | real                  | real                  | real                  |
+| normal  | `/first-party/proxy`                   | `GET`                                                      | literal        | `settings.auction.rewrite_creatives`         | real                  | real                  | real                  | real                  |
+| normal  | `/first-party/sign`                    | `GET`, `POST`                                              | literal        | `settings.auction.rewrite_creatives`         | real                  | real                  | real                  | real                  |
+| normal  | `/health`                              | `GET`                                                      | literal        | `always`                                     | real                  | real                  | —                     | real                  |
+| normal  | `/static/tsjs=<file>`                  | `GET`                                                      | template       | `path.starts_with(/static/tsjs=)`            | real                  | real                  | real                  | real                  |
+| normal  | `/verify-signature`                    | `POST`                                                     | literal        | `always`                                     | real                  | real                  | real                  | real                  |
+| normal  | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `publisher_fallback`                         | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
+| normal  | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `publisher_fallback`                         | publisher fallback    | publisher fallback    | publisher fallback    | publisher fallback    |
+| normal  | `<proxy.asset_routes[].prefix>{*rest}` | `GET`, `HEAD`                                              | config derived | `settings.proxy.asset_routes[]`              | real                  | —                     | —                     | —                     |
+| startup | `/health`                              | `GET`                                                      | literal        | `startup_error`                              | real                  | —                     | —                     | real                  |
+| startup | `/{*rest}`                             | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | template       | `startup_error`                              | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
+| startup | `/`                                    | `DELETE`, `GET`, `HEAD`, `OPTIONS`, `PATCH`, `POST`, `PUT` | literal        | `startup_error`                              | startup error (`500`) | startup error (`500`) | startup error (`500`) | startup error (`503`) |
 
 `real`, `unsupported`, `guarded`, `publisher fallback`, and `startup error` are
 distinct observable dispositions. An em dash means that the adapter has no
 local route; the publisher fallback can therefore receive that path. The
 startup rows are a separate degraded router, not additional normal routes.
+
+For `/auction` and the four `/first-party/` creative routes, the predicate
+names the switch that turns the endpoint on. The route stays registered while
+its switch is off. Its listed methods then return `404` with the plain-text
+body `This endpoint is turned off` and `Cache-Control: no-store, private`, and
+the request never reaches the publisher fallback. Other methods on these paths
+still go to the publisher fallback. On Fastly, an integration request filter
+such as DataDome runs before routing, so its answer keeps precedence over this
+`404`.
 
 ## Contract conventions
 
@@ -178,13 +187,20 @@ Consumers that previously matched the literal provider name `prebid` must use
 the configured provider ID, such as `pbs-main`.
 
 **Contract:** Auth: none. The buffered JSON body is limited to 256 KiB. A
-successful auction and an intentional no-bid both return `200` JSON; disabling
-`[auction]` or denying consent produces the no-bid form without calling a
-provider. An oversized body returns `413`; malformed input and validation
-failures use the shared adapter error mapping; provider failures use the shared
-`5xx` mapping. The endpoint sets no dedicated cache or CORS policy and has no
-in-process rate limiter. Provider selection, timeouts, and fan-out are governed
-by `[auction]` and the enabled provider profiles.
+successful auction and an intentional no-bid both return `200` JSON; denying
+consent produces the no-bid form without calling a provider. An oversized body
+returns `413`; malformed input and validation failures use the shared adapter
+error mapping; provider failures use the shared `5xx` mapping. The endpoint
+sets no dedicated cache or CORS policy and has no in-process rate limiter.
+Provider selection, timeouts, and fan-out are governed by `[auction]` and the
+enabled provider profiles.
+
+While `[auction].enabled = false`, the default, the endpoint returns `404` with
+the plain-text body `This endpoint is turned off` and
+`Cache-Control: no-store, private` instead. It answers before any body size
+or parse check, so an oversized or malformed body also gets this `404`. It
+calls no provider and emits no telemetry event. See
+[Route availability](#route-availability).
 
 **Request Body:**
 
@@ -467,6 +483,10 @@ validates an existing signature—it does not mint one. Signing depends on
 `publisher.proxy_secret`; server-side fetches also enforce
 `proxy.allowed_domains`.
 
+While `[auction].rewrite_creatives = false`, the endpoint returns `404` with
+`Cache-Control: no-store, private` before it validates the token or fetches
+anything. See [Route availability](#route-availability).
+
 **Example:**
 
 ```bash
@@ -478,6 +498,7 @@ curl "https://edge.example.com/first-party/proxy?tsurl=https://ad.doubleclick.ne
 **Error Responses:**
 
 - `403 Forbidden` - Token validation or allowed-domain validation failed
+- `404 Not Found` - `[auction].rewrite_creatives` is off
 - `502 Bad Gateway` - Missing signing fields, invalid/expired expiration, or
   upstream proxy failure
 
@@ -514,6 +535,12 @@ because it performs no server-side fetch. Signature errors have the same `403`
 versus shared `502` split as `/first-party/proxy`. The route has no dedicated
 CORS grant or rate limiter and validates rather than mints a signature.
 
+While click wrapping is off, the endpoint returns `404` with
+`Cache-Control: no-store, private` before it validates the token. Click
+wrapping is off when `[auction].rewrite_clicks = false`, or when
+`rewrite_creatives = false` and `rewrite_clicks` is unset. See
+[Route availability](#route-availability).
+
 **Example:**
 
 ```bash
@@ -536,6 +563,11 @@ type but no dedicated cache or CORS policy and has no rate limiter. It mints a
 new proxy signature; it does not validate a caller-supplied `tstoken`.
 Signing depends on `publisher.proxy_secret` and checks
 `proxy.allowed_domains` before minting.
+
+While `[auction].rewrite_creatives = false`, GET and POST return `404` with
+`Cache-Control: no-store, private` before any body or URL check. The creative
+runtime then loads the original URL. See
+[Route availability](#route-availability).
 
 **Request Methods:** GET or POST
 
@@ -570,6 +602,7 @@ warning. `base` is the normalized target without its query or fragment.
 **Error Responses:**
 
 - `403 Forbidden`: The target has a valid host that does not match a non-empty `proxy.allowed_domains` list
+- `404 Not Found`: `[auction].rewrite_creatives` is off
 - `413 Payload Too Large`: The POST body exceeds 64 KiB
 - `502 Bad Gateway`: The target host matches `rewrite.exclude_domains` or is outside a non-empty `rewrite.include_domains`
 - Shared `5xx`: Malformed JSON or an invalid/unsupported target under the
@@ -597,6 +630,12 @@ mapping; oversized bodies return `413`. There is no dedicated CORS grant or
 rate limiter. Rebuild validates the old signature before minting its
 replacement and never permits `tsurl`, `tstoken`, or `tsexp` mutation.
 Validation and re-signing depend on `publisher.proxy_secret`.
+
+While click wrapping is off, any `POST` returns `404` with
+`Cache-Control: no-store, private` before its content type, body or token is
+checked. The switch is the same as for
+[`/first-party/click`](#get-first-party-click). See
+[Route availability](#route-availability).
 
 **Request Body:**
 
@@ -649,7 +688,8 @@ Navigation form of the same recovery, for creatives rendered in a sandboxed ifra
 `Location` and `Cache-Control: no-store, private`. The browser follows it to
 `/first-party/click`, which redirects on to the advertiser.
 
-Validation is identical to the POST form.
+Validation is identical to the POST form. While click wrapping is off, the GET
+form also returns `404` with `Cache-Control: no-store, private`.
 
 **Form-encoded POST (navigation, no URL length limit):** when the GET recovery URL would exceed the platform's request-URL limit (Fastly Compute rejects request URLs over 8192 bytes before the handler runs), the click guard submits a form instead. A `POST` carrying `Content-Type: application/x-www-form-urlencoded` with the same `tsclick`/`add`/`del` fields is treated as a navigation and answered with the same `302`, not the JSON body.
 

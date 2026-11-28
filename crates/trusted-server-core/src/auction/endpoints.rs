@@ -20,6 +20,7 @@ use crate::ec::kv_types::MAX_UID_LENGTH;
 use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
+use crate::http_util::endpoint_turned_off_response;
 use crate::openrtb::{Eid, Uid};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
@@ -94,6 +95,13 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// are enabled by default. When either is on, a bidder `<base>` loses its
 /// `href` (a `target` is kept) and creative TSJS is injected.
 ///
+/// While the auction is off ([`AuctionOrchestrator::is_enabled`] is `false`,
+/// which production sets from
+/// [`auction.enabled`][`crate::auction_config_types::AuctionConfig::enabled`]),
+/// it instead answers the turned-off `404` from
+/// [`endpoint_turned_off_response`] before it checks the body size or reads the
+/// body, and records no trace or telemetry.
+///
 /// ## Scroll, refresh, and SPA navigation
 ///
 /// This endpoint is intended for **initial page render** and **programmatic
@@ -128,6 +136,10 @@ pub async fn handle_auction(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !orchestrator.is_enabled() {
+        return Ok(endpoint_turned_off_response("/auction", "auction.enabled"));
+    }
+
     // Reject oversized bodies before core buffers/parses them. The Content-Length
     // pre-check stops well-behaved clients early; the post-read check defends
     // against clients that lie about (or omit) the header.
@@ -194,58 +206,6 @@ pub async fn handle_auction(
         None
     };
     let consent_context = ec_context.consent().clone();
-
-    if !orchestrator.is_enabled() {
-        log::info!("/auction: auction is disabled; returning no-bid response");
-        let auction_request = convert_tsjs_to_auction_request(
-            &body,
-            settings,
-            services,
-            &http_req,
-            consent_context,
-            ec_id.as_deref(),
-            None,
-        )?;
-        let trace = capture_api_trace(&mut http_req, &auction_request);
-        if let Some(trace) = &trace {
-            trace.finish(
-                TraceAuctionTerminalStatus::Skipped,
-                Some(TraceAuctionTerminalReason::PolicySkipped),
-            );
-        }
-        let observation = AuctionObservationContext::from_auction_request(
-            AuctionSource::AuctionApi,
-            &auction_request,
-            ec_context,
-        );
-        let elapsed_ms = observation.elapsed_ms();
-        emit_auction_events_best_effort_lazy(services, || {
-            build_auction_events(
-                observation,
-                AuctionTerminalOutcome::Skipped {
-                    reason: "auction_disabled",
-                    elapsed_ms,
-                },
-            )
-        })
-        .await;
-
-        let empty_result = OrchestrationResult {
-            provider_responses: Vec::new(),
-            mediator_response: None,
-            winning_bids: HashMap::new(),
-            total_time_ms: 0,
-            metadata: HashMap::new(),
-        };
-        return convert_to_openrtb_response_with_trace(
-            &empty_result,
-            settings,
-            &auction_request,
-            ec_context.ec_allowed(),
-            trace.as_ref(),
-        )
-        .map(|conversion| retain_private_trace(conversion.response, trace));
-    }
 
     // Server-side auction consent gate. The publisher-navigation and
     // `/_ts/page-bids` paths fail closed for GDPR/unknown jurisdictions that
@@ -708,7 +668,9 @@ mod tests {
         StubHttpClient, noop_services,
     };
     use crate::platform::{ClientInfo, PlatformHttpClient, PlatformHttpRequest, PlatformResponse};
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        assert_endpoint_turned_off, crate_test_settings_str, create_test_settings,
+    };
     use crate::trace::TracePreDispatchHook;
     use base64::Engine as _;
     use base64::engine::general_purpose::STANDARD as BASE64;
@@ -1123,8 +1085,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn disabled_auction_endpoint_emits_skipped_telemetry_without_provider_work() {
-        let settings = create_test_settings();
+    async fn turned_off_auction_endpoint_answers_404_without_work() {
+        let mut settings = create_test_settings();
+        settings
+            .integrations
+            .insert_config(
+                "gpt_diagnostics",
+                &json!({"enabled":true,"trace_page_enabled":true}),
+            )
+            .expect("should enable trace capture");
+        let settings = Arc::new(settings);
         let config = AuctionConfig {
             enabled: false,
             providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
@@ -1137,19 +1107,24 @@ mod tests {
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
         let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
-        let body = json!({
-            "adUnits": [{
-                "code": "div-gpt-ad-1",
-                "mediaTypes": { "banner": { "sizes": [[300, 250]] } }
-            }]
-        });
-        let request = Request::builder()
+        let mut request = Request::builder()
             .method("POST")
+            .header("cookie", "__Host-ts-console=1")
             .uri("https://test-publisher.example/auction")
-            .body(EdgeBody::from(
-                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
-            ))
-            .expect("should build disabled-auction request");
+            .body(EdgeBody::from("not json"))
+            .expect("should build turned-off auction request with a body that is not JSON");
+
+        let hook = TracePreDispatchHook::new(
+            Arc::clone(&settings),
+            Arc::new(|_| panic!("should not load setup metadata on API capture")),
+        );
+        assert!(
+            hook.handle(&mut request)
+                .await
+                .expect("should freeze API cookies")
+                .is_none(),
+            "should retain ordinary API routing"
+        );
 
         let response = handle_auction(
             &settings,
@@ -1161,26 +1136,65 @@ mod tests {
             request,
         )
         .await
-        .expect("disabled auction should return a no-bid response");
+        .expect("should answer the turned-off auction locally");
 
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "disabled auction should return a 200 no-bid response"
+        assert!(
+            telemetry_sink
+                .batches
+                .lock()
+                .expect("should lock telemetry batches")
+                .is_empty(),
+            "should emit no telemetry"
         );
-        let batches = telemetry_sink
-            .batches
-            .lock()
-            .expect("should lock telemetry batches");
-        assert_eq!(batches.len(), 1, "should emit one telemetry batch");
-        let rows = batches[0].rows();
-        assert_eq!(rows.len(), 1, "should emit one skipped summary row");
-        assert_eq!(rows[0].event_kind, "summary", "should emit a summary row");
-        assert_eq!(rows[0].terminal_status.as_deref(), Some("skipped"));
-        assert_eq!(
-            rows[0].terminal_reason.as_deref(),
-            Some("auction_disabled"),
-            "should identify the disabled auction policy"
+        assert!(
+            response
+                .extensions()
+                .get::<crate::trace::TraceAuctionCarry>()
+                .is_none(),
+            "should capture no trace"
+        );
+        assert_endpoint_turned_off(response, "POST /auction with the auction off");
+    }
+
+    #[tokio::test]
+    async fn turned_off_auction_endpoint_answers_before_the_size_check() {
+        let settings = create_test_settings();
+        let config = AuctionConfig {
+            enabled: false,
+            providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
+            timeout_ms: 2000,
+            mediator: None,
+            ..Default::default()
+        };
+        let mut orchestrator = AuctionOrchestrator::new(config);
+        orchestrator.register_provider(Arc::new(PanicOnBidProvider));
+        let services = noop_services();
+        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let request = Request::builder()
+            .method("POST")
+            .uri("https://test-publisher.example/auction")
+            .header(
+                header::CONTENT_LENGTH,
+                (MAX_AUCTION_BODY_SIZE + 1).to_string(),
+            )
+            .body(EdgeBody::empty())
+            .expect("should build an over-limit turned-off auction request");
+
+        let response = handle_auction(
+            &settings,
+            &orchestrator,
+            None,
+            None,
+            &mut ec_context,
+            &services,
+            request,
+        )
+        .await
+        .expect("should answer the over-limit turned-off auction locally");
+
+        assert_endpoint_turned_off(
+            response,
+            "POST /auction over the size limit with the auction off",
         );
     }
 
@@ -1311,11 +1325,11 @@ mod tests {
                 .expect("should enable trace feature");
             let settings = Arc::new(settings);
             let orchestrator = AuctionOrchestrator::new(AuctionConfig {
-                enabled: false,
+                enabled: true,
                 ..Default::default()
             });
             let services = services_with_telemetry(Arc::new(RecordingTelemetrySink::default()));
-            let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+            let mut ec_context = make_ec_context(Jurisdiction::Unknown, None);
             let body = json!({"adUnits":[
                 {"code":"filtered","mediaTypes":{"video":{}},"ext":{"trusted_server":{"trace_slot_ref":SECOND}}},
                 {"code":"duplicate","mediaTypes":{"banner":{"sizes":[[300,250]]}},"ext":{"trusted_server":{"trace_slot_ref":FIRST}}},
@@ -1420,7 +1434,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn trace_auction_api_frozen_disabled_capture_delivers_private_evidence() {
+    async fn trace_auction_api_frozen_consent_denied_capture_delivers_private_evidence() {
         let mut settings = create_test_settings();
         settings
             .integrations
@@ -1432,7 +1446,7 @@ mod tests {
         let settings = Arc::new(settings);
 
         let config = AuctionConfig {
-            enabled: false,
+            enabled: true,
             providers: AuctionConfig::legacy_provider_map(&["panic_provider"]),
             timeout_ms: 2000,
             mediator: None,
@@ -1442,7 +1456,7 @@ mod tests {
         orchestrator.register_provider(Arc::new(PanicOnBidProvider));
         let telemetry_sink = Arc::new(RecordingTelemetrySink::default());
         let services = services_with_telemetry(Arc::clone(&telemetry_sink));
-        let mut ec_context = make_ec_context(Jurisdiction::NonRegulated, None);
+        let mut ec_context = make_ec_context(Jurisdiction::Unknown, None);
         let body = json!({
             "adUnits": [{
                 "code": "div-gpt-ad-1",
@@ -1454,9 +1468,9 @@ mod tests {
             .header("cookie", "__Host-ts-console=1")
             .uri("https://test-publisher.example/auction")
             .body(EdgeBody::from(
-                serde_json::to_vec(&body).expect("should serialize disabled-auction body"),
+                serde_json::to_vec(&body).expect("should serialize consent-denied auction body"),
             ))
-            .expect("should build disabled-auction request");
+            .expect("should build consent-denied auction request");
 
         let hook = TracePreDispatchHook::new(
             Arc::clone(&settings),
@@ -1480,12 +1494,12 @@ mod tests {
             request,
         )
         .await
-        .expect("disabled auction should return a no-bid response");
+        .expect("should return a no-bid response when consent is denied");
 
         assert_eq!(
             response.status(),
             StatusCode::OK,
-            "disabled auction should return a 200 no-bid response"
+            "consent-denied auction should return a 200 no-bid response"
         );
         let carry = response
             .extensions()
@@ -1503,7 +1517,7 @@ mod tests {
         );
         assert_eq!(
             facts["evidence"]["terminal_reason"], "policy_skipped",
-            "should observe the explicit disabled policy"
+            "should observe the explicit consent-denied policy"
         );
         let bytes = response
             .into_body()
@@ -2170,7 +2184,8 @@ mod tests {
             use crate::platform::test_support::noop_services;
             use crate::test_support::tests::create_test_settings;
 
-            let settings = create_test_settings();
+            let mut settings = create_test_settings();
+            settings.auction.enabled = true;
             let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
             let services = noop_services();
             let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());
@@ -2213,7 +2228,8 @@ mod tests {
             use crate::platform::test_support::noop_services;
             use crate::test_support::tests::create_test_settings;
 
-            let settings = create_test_settings();
+            let mut settings = create_test_settings();
+            settings.auction.enabled = true;
             let orchestrator = build_orchestrator(&settings).expect("should build orchestrator");
             let services = noop_services();
             let mut ec_context = EcContext::new_for_test(None, ConsentContext::default());

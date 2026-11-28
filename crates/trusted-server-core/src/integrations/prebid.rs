@@ -1125,6 +1125,7 @@ impl PrebidIntegration {
             } else {
                 Vec::new()
             }),
+            auction_enabled: plan.enabled(),
             ..InjectedPrebidClientConfig::from(browser_config)
         };
         let config_json = serialize_injected_prebid_config(&payload);
@@ -1584,6 +1585,8 @@ struct InjectedPrebidClientConfig<'a> {
     client_side_bidders: &'a [String],
     #[serde(skip_serializing_if = "<[String]>::is_empty")]
     excluded_gam_ad_unit_path_suffixes: &'a [String],
+    /// Whether the server auction is on. Declared last so it serializes last.
+    auction_enabled: bool,
 }
 
 impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
@@ -1601,6 +1604,7 @@ impl<'a> From<&'a PrebidIntegrationConfig> for InjectedPrebidClientConfig<'a> {
             server_side_bidders: None,
             client_side_bidders: &config.client_side_bidders,
             excluded_gam_ad_unit_path_suffixes: &config.excluded_gam_ad_unit_path_suffixes,
+            auction_enabled: true,
         }
     }
 }
@@ -5677,12 +5681,21 @@ external_bundle_sri = "sha384-AAAA"
         assert!(!script.contains("pbs-secondary"));
         assert!(!script.contains("3000"));
         assert!(!script.contains("4000"));
+        assert!(
+            script.contains(r#""auctionEnabled":true"#),
+            "should mark an enabled auction: {script}"
+        );
 
         let disabled_plan = plan.clone().with_enabled(false);
         let disabled_inserts = integration.head_inserts_for_plan(&browser_config, &disabled_plan);
         assert!(
             disabled_inserts[0].contains(r#""serverSideBidders":[]"#),
             "auction kill switch should suppress browser server-side bidders: {}",
+            disabled_inserts[0]
+        );
+        assert!(
+            disabled_inserts[0].contains(r#""auctionEnabled":false"#),
+            "should mark a disabled auction: {}",
             disabled_inserts[0]
         );
     }

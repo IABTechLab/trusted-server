@@ -223,12 +223,16 @@ function expectNoUnexpectedNetworkActivity(stubs) {
   ).toEqual([]);
 }
 
-function installServerState(pageWindow, { analytics = false, managedUserIds } = {}) {
+function installServerState(
+  pageWindow,
+  { analytics = false, managedUserIds, auctionEnabled } = {}
+) {
   pageWindow.eval('window.pbjs = { que: [], cmd: [] };');
   pageWindow.__tsjs_prebid = {
     clientSideBidders: [],
     serverSideBidders: ['appnexus'],
     ...(managedUserIds ? { managedUserIds } : {}),
+    ...(auctionEnabled === undefined ? {} : { auctionEnabled }),
   };
 
   if (analytics) {
@@ -308,6 +312,45 @@ async function runAuction(pageWindow, fetchSpy) {
   expect(generated.bids[0].params).toEqual({ bidderParams: {}, storedRequest: false });
 }
 
+// Run one auction whose ad unit carries a trustedServer bid and a bid from a
+// publisher alias of trustedServer, and wait for Prebid to finish it.
+function runAliasAuction(pageWindow) {
+  pageWindow.pbjs.aliasBidder('trustedServer', 'exampleAlias');
+  const slot = pageWindow.document.createElement('div');
+  slot.id = 'ad-slot-1';
+  pageWindow.document.body.appendChild(slot);
+
+  return new Promise((resolve) =>
+    pageWindow.pbjs.requestBids({
+      adUnits: [
+        {
+          code: 'ad-slot-1',
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          bids: [
+            { bidder: 'trustedServer', params: {} },
+            { bidder: 'exampleAlias', params: {} },
+          ],
+        },
+      ],
+      timeout: 1000,
+      bidsBackHandler: resolve,
+    })
+  );
+}
+
+// Every request, on any transport, that went to the auction endpoint.
+function auctionRequests(stubs) {
+  return stubs.requests.filter((entry) =>
+    requestUrl(entry.url ?? entry.resource).includes('/auction')
+  );
+}
+
+async function postedBidders({ resource, init, body }) {
+  const text =
+    init?.body ?? body ?? (typeof resource === 'object' ? await resource.text() : undefined);
+  return JSON.parse(text).adUnits.flatMap((unit) => unit.bids.map((bid) => bid.bidder));
+}
+
 function expectManifest(manifest, analytics) {
   expect(manifest).toMatchObject({
     schemaVersion: 1,
@@ -333,9 +376,11 @@ describe('tsjs-prebid production artifacts', () => {
     expect(analyticsArtifact.bundleCode.length).toBeGreaterThan(200_000);
     // The original shim measures 40,354 characters. Shared strict trace JSON
     // validation, request-ID hook association, and bounded pending lifecycle add
-    // 11,676 characters (52,030 total). Keep a narrow 52.5 KB guard: Prebid remains a separate artifact above 200 KB, and importing
+    // 11,676 characters (52,030 total). Keep a narrow guard: Prebid remains a separate artifact above 200 KB, and importing
     // its runtime or private rendering helpers must still fail this regression.
-    expect(shimCode.length).toBeLessThan(52_500);
+    // Skipping the trustedServer bid and request while the auction is off adds
+    // about 140 characters, so the guard is 52.75 KB.
+    expect(shimCode.length).toBeLessThan(52_750);
     expect(shimCode).toContain('markWinningBidAsUsed');
   });
 
@@ -515,6 +560,43 @@ describe('tsjs-prebid production artifacts', () => {
       expect(pageWindow.__tsjs_prebid_bundle.modules.analytics).toEqual([]);
       expect(pageWindow.__tsjs_prebid_bundle.runtimeCodes.analytics).toEqual([]);
       await runAuction(pageWindow, stubs.fetchSpy);
+      expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.close();
+    }
+  }, 60_000);
+
+  it('sends no POST /auction from trustedServer or its alias while the auction is off', async () => {
+    const dom = createPage();
+    try {
+      const pageWindow = dom.window;
+      const stubs = installNetworkAndConsoleStubs(pageWindow);
+      installServerState(pageWindow, { auctionEnabled: false });
+
+      pageWindow.eval(noAnalyticsArtifact.bundleCode);
+      pageWindow.eval(shimCode);
+      await runAliasAuction(pageWindow);
+
+      expect(auctionRequests(stubs)).toEqual([]);
+      expectNoUnexpectedNetworkActivity(stubs);
+    } finally {
+      dom.window.close();
+    }
+  }, 60_000);
+
+  it('posts to /auction from trustedServer and its alias when the injected config omits auctionEnabled', async () => {
+    const dom = createPage();
+    try {
+      const pageWindow = dom.window;
+      const stubs = installNetworkAndConsoleStubs(pageWindow);
+      installServerState(pageWindow);
+
+      pageWindow.eval(noAnalyticsArtifact.bundleCode);
+      pageWindow.eval(shimCode);
+      await runAliasAuction(pageWindow);
+
+      const bidders = await Promise.all(auctionRequests(stubs).map(postedBidders));
+      expect(bidders.flat().sort()).toEqual(['exampleAlias', 'trustedServer']);
       expectNoUnexpectedNetworkActivity(stubs);
     } finally {
       dom.window.close();

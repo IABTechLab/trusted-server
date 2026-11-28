@@ -9,7 +9,8 @@
 //   4. Maps parsed AuctionBids into Prebid bid response objects
 //
 // The shim on requestBids injects "trustedServer" into every ad unit so all
-// bids flow through the orchestrator.
+// bids flow through the orchestrator. While the injected config turns the
+// auction off, it removes "trustedServer" instead and sends no /auction request.
 
 import type _pbjsDefault from 'prebid.js';
 
@@ -195,6 +196,8 @@ interface InjectedPrebidConfig {
   excludedGamAdUnitPathSuffixes?: string[];
   /** Operator-owned Prebid User ID module entries, forwarded verbatim. */
   managedUserIds?: InjectedManagedUserId[];
+  /** False when `[auction].enabled` is off. Absent means on. */
+  auctionEnabled?: boolean;
 }
 
 /**
@@ -236,6 +239,14 @@ export function getInjectedConfig(): InjectedPrebidConfig | undefined {
 
 function injectedServerSideBidderCodes(config = getInjectedConfig()): string[] {
   return config?.serverSideBidders ?? [];
+}
+
+/**
+ * Whether the server auction is on. While it is off, the server answers
+ * `POST /auction` with a 404, so the shim sends no `trustedServer` demand.
+ */
+function injectedAuctionEnabled(config = getInjectedConfig()): boolean {
+  return config?.auctionEnabled !== false;
 }
 
 /** Collect all unique bidder codes from the provided ad units. */
@@ -2410,7 +2421,11 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       return true; // All requests are valid — orchestrator handles filtering
     },
 
-    buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest {
+    buildRequests(validBidRequests: TrustedServerBidRequest[]): TrustedServerRequest | [] {
+      // Prebid copies this spec for a publisher alias of trustedServer, and
+      // refresh keeps alias bids as browser demand, so removing trustedServer
+      // bids alone cannot stop /auction calls while the auction is off.
+      if (!injectedAuctionEnabled()) return [];
       log.debug('[tsjs-prebid] buildRequests', { count: validBidRequests.length });
       const requestScopedBidRequests = [...validBidRequests];
       const hasUserIdApi = typeof pbjs.getUserIdsAsEids === 'function';
@@ -2492,7 +2507,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   // Shim requestBids to inject the trustedServer bidder into every ad unit
   // so plan-owned server-side bids flow through the /auction orchestrator while
-  // every unowned bidder is left untouched.
+  // every unowned bidder is left untouched. While the auction is off it injects
+  // none and removes any present.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
     trySeedManagedUserIds?.();
@@ -2502,14 +2518,13 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const explicitAdUnits = (opts as any).adUnits as TrustedServerAdUnit[] | undefined;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const requestedAdUnitCodes = Array.isArray((opts as any).adUnitCodes)
-      ? new Set(
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          ((opts as any).adUnitCodes as unknown[]).filter(
-            (code): code is string => typeof code === 'string'
-          )
-        )
-      : undefined;
+    const rawAdUnitCodes = (opts as any).adUnitCodes as unknown;
+    // Prebid's filterAdUnits selects every ad unit for an empty adUnitCodes
+    // list, so only a non-empty list narrows the global units.
+    const requestedAdUnitCodes =
+      Array.isArray(rawAdUnitCodes) && rawAdUnitCodes.length > 0
+        ? new Set(rawAdUnitCodes.filter((code): code is string => typeof code === 'string'))
+        : undefined;
     const adUnits = (explicitAdUnits ?? (pbjs.adUnits as TrustedServerAdUnit[]) ?? []).filter(
       (unit) =>
         explicitAdUnits !== undefined ||
@@ -2541,7 +2556,10 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       );
     }
 
-    // Ensure every ad unit has a trustedServer bid entry
+    const auctionEnabled = injectedAuctionEnabled();
+
+    // Ensure every ad unit has a trustedServer bid entry, or none while the
+    // auction is off
     for (const unit of adUnits) {
       if (!syntheticRefreshAdUnits.has(unit)) {
         const snapshot = capturePublisherAdUnitSnapshot(unit, serverSideBidders);
@@ -2552,6 +2570,14 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
       if (!Array.isArray(unit.bids)) {
         unit.bids = [];
+      }
+
+      // While the auction is off, /auction answers 404, so the unit keeps only
+      // its browser demand: no trustedServer bid is added and any present one,
+      // including a refresh unit's, is dropped.
+      if (!auctionEnabled) {
+        unit.bids = unit.bids.filter((bid) => bid?.bidder !== ADAPTER_CODE);
+        continue;
       }
 
       // Preserve params only for bidder codes owned by the validated auction

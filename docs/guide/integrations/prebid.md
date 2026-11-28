@@ -165,6 +165,18 @@ bids are folded into the `trustedServer.params.bidderParams` envelope. Configure
 `client_side_bidders` and other unowned demand remain native browser bids. Both
 paths compete in the same Prebid.js auction.
 
+While `[auction].enabled = false`, the server answers `POST /auction` with a
+`404`, and the injected config carries `auctionEnabled: false`. The shim then
+sends no `trustedServer` demand. It adds no `trustedServer` bid to any ad unit
+and drops one the publisher configured, and the `trustedServer` adapter builds
+no request, so a publisher alias of it sends nothing either. Every other bidder
+runs as before, as native browser demand. A config without `auctionEnabled`
+means the auction is on. Pages cached before the auction was turned off still
+call `POST /auction` and get the `404` until they expire.
+
+`pbjs.requestBids({ adUnitCodes: [] })` selects every ad unit in
+`pbjs.adUnits`, as in Prebid.
+
 The reserved `trustedServer` envelope cannot select a provider or endpoint. Its
 nested bidder keys resolve through `[auction.bidders]`, and one envelope accepts
 at most 128 bidder entries. The optional `zone` fact is limited to 256 UTF-8

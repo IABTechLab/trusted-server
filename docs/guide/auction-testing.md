@@ -40,7 +40,7 @@ curl --fail-with-body \
 
 Check the response and logs for these invariants:
 
-- a disabled auction returns a no-bid response without provider dispatch;
+- a disabled auction returns the turned-off `404` without provider dispatch;
 - `routing = "explicit"` sends a slot only to its mapped provider;
 - `routing = "all_eligible"` sends eligible banner slots without leaking
   another provider's bidder parameters;

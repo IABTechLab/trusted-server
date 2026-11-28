@@ -1,5 +1,6 @@
 use crate::http_util::{
-    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, endpoint_turned_off_response,
+    enforce_max_body_size,
 };
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
@@ -1581,6 +1582,9 @@ async fn proxy_with_redirects(
 ///   `application/octet-stream` content type if origin omitted it, and logs likely 1×1
 ///   pixels using simple size/URL heuristics. No special response (still proxied).
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// `[auction] rewrite_creatives` is off.
+///
 /// # Errors
 ///
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
@@ -1589,6 +1593,13 @@ pub async fn handle_first_party_proxy(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrite_creatives {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/proxy",
+            "auction.rewrite_creatives",
+        ));
+    }
+
     // Parse, reconstruct, and validate the signed target URL
     let SignedTarget { target_url, .. } =
         reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
@@ -1620,14 +1631,27 @@ pub async fn handle_first_party_proxy(
 /// target URL. This avoids parsing/downloading the content and lets the browser
 /// navigate directly to the destination under first-party control.
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// click wrapping is off: `[auction] rewrite_clicks`, or `rewrite_creatives`
+/// when it is unset ([`AuctionConfig::rewrites_auction_clicks`]).
+///
 /// # Errors
 ///
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
+///
+/// [`AuctionConfig::rewrites_auction_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_auction_clicks
 pub async fn handle_first_party_click(
     settings: &Settings,
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrites_auction_clicks() {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/click",
+            "auction.rewrite_clicks",
+        ));
+    }
+
     let SignedTarget {
         target_url: full_for_token,
         tsurl,
@@ -1699,6 +1723,9 @@ pub async fn handle_first_party_click(
 /// `{ href, base }` where `href` is the signed `/first-party/proxy?...` path and `base`
 /// is the normalized clear URL.
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// `[auction] rewrite_creatives` is off.
+///
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL cannot be parsed, the URL uses an
@@ -1711,6 +1738,13 @@ pub async fn handle_first_party_proxy_sign(
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrite_creatives {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/sign",
+            "auction.rewrite_creatives",
+        ));
+    }
+
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     // Capture the request's own scheme before the body is consumed: a
@@ -1893,6 +1927,9 @@ struct ProxyRebuildResp {
 /// - Only allows adding new parameters or removing existing ones.
 /// - Base tsurl cannot change.
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// click wrapping is off, the same switch as [`handle_first_party_click`].
+///
 /// # Errors
 ///
 /// Returns an error if JSON parsing fails, the URL is invalid, or the request body cannot be read.
@@ -1901,6 +1938,13 @@ pub async fn handle_first_party_proxy_rebuild(
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrites_auction_clicks() {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/proxy-rebuild",
+            "auction.rewrite_clicks",
+        ));
+    }
+
     let method = req.method().clone();
     let req_query = req.uri().query().unwrap_or_default().to_owned();
     // A form POST is a navigation, not a fetch: the click guard uses it when the
@@ -2280,7 +2324,9 @@ mod tests {
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        assert_endpoint_turned_off, crate_test_settings_str, create_test_settings,
+    };
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -3382,6 +3428,161 @@ mod tests {
             url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
             token,
         )
+    }
+
+    // Route a request to the creative endpoint handler its path names.
+    async fn call_creative_endpoint(
+        settings: &Settings,
+        req: HttpRequest<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let services = noop_services();
+        let path = req.uri().path().to_owned();
+        match path.as_str() {
+            "/first-party/proxy" => handle_first_party_proxy(settings, &services, req).await,
+            "/first-party/sign" => handle_first_party_proxy_sign(settings, &services, req).await,
+            "/first-party/click" => handle_first_party_click(settings, &services, req).await,
+            "/first-party/proxy-rebuild" => {
+                handle_first_party_proxy_rebuild(settings, &services, req).await
+            }
+            other => panic!("should name a creative endpoint, got {other}"),
+        }
+    }
+
+    #[test]
+    fn creative_endpoints_follow_their_switches() {
+        assert!(
+            !create_test_settings().auction.enabled,
+            "should build every case with the auction off, so the creative gates cannot depend on the auction switch"
+        );
+        // (rewrite_creatives, rewrite_clicks, proxy and sign answer, click and rebuild answer)
+        let cases = [
+            (false, None, false, false),
+            (false, Some(true), false, true),
+            (false, Some(false), false, false),
+            (true, Some(false), true, false),
+            (true, Some(true), true, true),
+            (true, None, true, true),
+        ];
+
+        futures::executor::block_on(async {
+            for (rewrite_creatives, rewrite_clicks, creatives_answer, clicks_answer) in cases {
+                let mut settings = create_test_settings();
+                settings.auction.rewrite_creatives = rewrite_creatives;
+                settings.auction.rewrite_clicks = rewrite_clicks;
+                // None of these carries the input its handler needs, so a
+                // handler past its gate returns `Err`.
+                let requests = [
+                    (
+                        "GET /first-party/proxy",
+                        creatives_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+                    ),
+                    (
+                        "GET /first-party/sign",
+                        creatives_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/sign"),
+                    ),
+                    (
+                        "POST /first-party/sign",
+                        creatives_answer,
+                        build_http_post_json_request(
+                            "https://edge.example/first-party/sign",
+                            &serde_json::json!({}),
+                        ),
+                    ),
+                    (
+                        "GET /first-party/click",
+                        clicks_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/click"),
+                    ),
+                    (
+                        "GET /first-party/proxy-rebuild",
+                        clicks_answer,
+                        build_http_request(
+                            Method::GET,
+                            "https://edge.example/first-party/proxy-rebuild",
+                        ),
+                    ),
+                    (
+                        "POST /first-party/proxy-rebuild",
+                        clicks_answer,
+                        build_http_post_json_request(
+                            "https://edge.example/first-party/proxy-rebuild",
+                            &serde_json::json!({}),
+                        ),
+                    ),
+                ];
+
+                for (request, answers, req) in requests {
+                    let label = format!(
+                        "{request} with rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}"
+                    );
+                    let result = call_creative_endpoint(&settings, req).await;
+                    if answers {
+                        assert!(
+                            result.is_err(),
+                            "{label}: should pass the gate, got {result:?}"
+                        );
+                    } else {
+                        let response = result.unwrap_or_else(|error| {
+                            panic!("{label}: should answer locally: {error:?}")
+                        });
+                        assert_endpoint_turned_off(response, &label);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn turned_off_creative_endpoints_ignore_valid_signatures() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.auction.rewrite_creatives = false;
+            settings.auction.rewrite_clicks = None;
+            let tsurl = "https://cdn.example/pixel.png";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let signed_proxy = format!(
+                "https://edge.example/first-party/proxy?tsurl={}&tstoken={token}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            );
+            let signed_rebuild = format!(
+                "https://edge.example/first-party/proxy-rebuild?tsclick={}",
+                url::form_urlencoded::byte_serialize(signed_click_target(&settings).as_bytes())
+                    .collect::<String>(),
+            );
+            let unparsable_sign = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/sign")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from("not json"))
+                .expect("should build sign request with a body that is not JSON");
+            let requests = [
+                (
+                    "signed GET /first-party/proxy",
+                    build_http_request(Method::GET, signed_proxy),
+                ),
+                (
+                    "signed GET /first-party/click",
+                    build_http_request(Method::GET, signed_click_target(&settings)),
+                ),
+                (
+                    "signed GET /first-party/proxy-rebuild",
+                    build_http_request(Method::GET, signed_rebuild),
+                ),
+                (
+                    "POST /first-party/sign with a body that is not JSON",
+                    unparsable_sign,
+                ),
+            ];
+
+            for (label, req) in requests {
+                let response = call_creative_endpoint(&settings, req)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: should answer locally: {error:?}"));
+                assert_endpoint_turned_off(response, label);
+            }
+        });
     }
 
     #[test]

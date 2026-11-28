@@ -58,7 +58,7 @@ flowchart TD
 The creative rewriters are invoked by independent delivery paths:
 
 1. **Auction `adm`**: Winning-bid HTML returned by `POST /auction` is optionally sanitized (`[auction].sanitize_creatives`, opt-in, default `false`) and rewritten (`[auction].rewrite_creatives`, default `true`). Click-through links are wrapped according to `[auction].rewrite_clicks`, which follows `rewrite_creatives` when unset.
-2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten independently of the auction setting. An explicitly set `[auction].rewrite_clicks` also applies to links in proxied HTML.
+2. **First-party proxy**: Non-streaming `text/html` and `text/css` responses fetched through `/first-party/proxy` are rewritten only while that endpoint is on, which needs `[auction].rewrite_creatives = true`. `[auction].enabled` does not affect them. An explicitly set `[auction].rewrite_clicks` also applies to links in proxied HTML.
 3. **Integration processing**: Publisher HTML integrations use their own registration and configuration controls.
 
 ::: info Streaming Mode
@@ -145,11 +145,29 @@ it while assets load direct. Neither switch is a consent control: EC issuance
 is consent-gated, and both endpoints forward whatever EC ID the request
 carries.
 
+The same switches decide which creative endpoints answer.
+`/first-party/proxy` and `/first-party/sign` answer only while
+`rewrite_creatives = true`. `/first-party/click` and
+`/first-party/proxy-rebuild` answer only while auction creatives wrap links:
+`rewrite_clicks = true`, or `rewrite_creatives = true` with `rewrite_clicks`
+unset. A turned-off endpoint returns `404` with
+`Cache-Control: no-store, private`; see
+[Route availability](/guide/api-reference#route-availability). The defaults
+keep all four endpoints on.
+
+::: warning Turning a switch off breaks creatives already on a page
+Creatives already on a page keep their rewritten URLs. Once `rewrite_creatives`
+is turned off, they stop loading proxied assets. Once click wrapping is turned
+off, their links land on the `404` instead of the advertiser.
+:::
+
 With `rewrite_creatives = false` and `rewrite_clicks = true`, `POST /auction`
 still injects TSJS, but this does not reopen asset proxying in practice:
 `/auction` creatives render in a sandbox without `allow-same-origin`, so the
 render guard skips `/first-party/sign` and script-inserted assets load direct.
-`/first-party/sign` itself is not gated by `rewrite_creatives`.
+`/first-party/sign` itself also answers only while `rewrite_creatives = true`,
+so a render guard that does call it gets the turned-off `404` and loads the
+original URL.
 
 Whenever either switch is on, a bidder `<base>` loses its `href` and keeps
 `target`; a `<base>` without `target` is removed. With `rewrite_creatives =
@@ -203,9 +221,10 @@ ships without them, so a processed or refused creative can never be re-fetched
 raw.
 :::
 
-`rewrite_creatives` and `sanitize_creatives` do not affect HTML/CSS rewriting
-under `/first-party/proxy`; an explicit `rewrite_clicks` does apply to links
-there. The publisher SSAT/page-bids path is a production creative path and
+`sanitize_creatives` does not affect HTML/CSS rewriting under
+`/first-party/proxy`, and `rewrite_creatives` only decides whether that
+endpoint answers; an explicit `rewrite_clicks` does apply to links there. The
+publisher SSAT/page-bids path is a production creative path and
 follows all three settings. `[debug].inject_adm_for_testing` controls only the
 additional `debug_bid` diagnostic blob and testing-only direct GAM replacement;
 it does not control whether the processed `adm` is present.

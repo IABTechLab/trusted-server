@@ -1435,6 +1435,7 @@ mod tests {
         RuntimeServices, TemplateCacheError, TemplateCacheKey, TemplateCacheLookup,
         TemplateCacheMiss, TemplateCacheReservation, TemplateEntry, TemplateMetadata,
     };
+    use trusted_server_core::response_privacy::TerminalPrivateResponse;
     use trusted_server_core::settings::Settings;
     use trusted_server_core::test_support::nextjs_auction;
 
@@ -1596,7 +1597,15 @@ mod tests {
     fn router_with_request_filters(
         filters: Vec<Arc<dyn IntegrationRequestFilter>>,
     ) -> RouterService {
-        let settings = test_settings();
+        router_with_settings_and_request_filters(test_settings(), filters)
+    }
+
+    /// Builds the same router as [`router_with_request_filters`] from the
+    /// given settings, so a test can turn endpoints off.
+    fn router_with_settings_and_request_filters(
+        settings: Settings,
+        filters: Vec<Arc<dyn IntegrationRequestFilter>>,
+    ) -> RouterService {
         let plan = Arc::new(
             trusted_server_core::auction::compile_auction_plan(&settings)
                 .expect("should compile auction plan"),
@@ -2854,6 +2863,64 @@ mod tests {
         );
     }
 
+    const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
+        ("GET", "/first-party/proxy"),
+        ("GET", "/first-party/sign"),
+        ("POST", "/first-party/sign"),
+        ("GET", "/first-party/click"),
+        ("GET", "/first-party/proxy-rebuild"),
+        ("POST", "/first-party/proxy-rebuild"),
+        ("POST", "/auction"),
+    ];
+
+    #[test]
+    fn turned_off_endpoints_answer_404_locally() {
+        let mut settings = test_settings();
+        settings.auction.enabled = false;
+        settings.auction.rewrite_creatives = false;
+        let state = build_state_from_settings(settings)
+            .expect("should build state with the endpoints turned off");
+        let router = TrustedServerApp::routes_for_state(&state);
+
+        for (method, path) in TURNED_OFF_REQUESTS {
+            let label = format!("{method} {path}");
+            let request_method =
+                Method::from_bytes(method.as_bytes()).expect("should parse request method");
+
+            let response = route(&router, empty_request(request_method, path));
+
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "{label}: should answer 404 while turned off"
+            );
+            assert_eq!(
+                response
+                    .headers()
+                    .get(header::CACHE_CONTROL)
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store, private"),
+                "{label}: should keep the turned-off answer out of every cache"
+            );
+            assert!(
+                response
+                    .extensions()
+                    .get::<TerminalPrivateResponse>()
+                    .is_some(),
+                "{label}: should reach the send boundary marked terminal-private"
+            );
+            let body = response
+                .into_body()
+                .into_bytes()
+                .unwrap_or_else(|| panic!("{label}: should buffer the turned-off body"));
+            assert_eq!(
+                body.as_ref(),
+                trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+                "{label}: should answer the turned-off body"
+            );
+        }
+    }
+
     #[test]
     fn dispatch_unregistered_method_returns_405_at_router_level() {
         // Documents the known router-level behavior for verbs outside the
@@ -3517,6 +3584,52 @@ mod tests {
                 .iter()
                 .any(|m| m.name == "x-challenge"),
             "the filter's response-header effect must be threaded out"
+        );
+    }
+
+    #[test]
+    fn request_filter_answer_wins_over_a_turned_off_auction() {
+        let mut settings = test_settings();
+        settings.auction.enabled = false;
+        let challenged = router_with_settings_and_request_filters(
+            settings.clone(),
+            vec![Arc::new(ChallengeRequestFilter)],
+        );
+        let allowed = router_with_settings_and_request_filters(
+            settings,
+            vec![Arc::new(RecordingRequestFilter)],
+        );
+
+        let challenge = route(&challenged, empty_request(Method::POST, "/auction"));
+        let turned_off = route(&allowed, empty_request(Method::POST, "/auction"));
+
+        assert_eq!(
+            challenge.status(),
+            StatusCode::FORBIDDEN,
+            "should keep the request filter's answer while the auction is off"
+        );
+        let challenge_body = challenge
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the challenge body");
+        assert_eq!(
+            challenge_body.as_ref(),
+            b"blocked",
+            "should answer the request filter's body, not the turned-off body"
+        );
+        assert_eq!(
+            turned_off.status(),
+            StatusCode::NOT_FOUND,
+            "should answer the turned-off 404 when the request filter continues"
+        );
+        let turned_off_body = turned_off
+            .into_body()
+            .into_bytes()
+            .expect("should buffer the turned-off body");
+        assert_eq!(
+            turned_off_body.as_ref(),
+            trusted_server_core::http_util::ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+            "should answer the turned-off body when the request filter continues"
         );
     }
 

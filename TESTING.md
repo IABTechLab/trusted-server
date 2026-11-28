@@ -119,13 +119,23 @@ Set:
 enabled = false
 ```
 
-`POST /auction` returns an immediate no-bid response, emits an
-`auction_disabled` skipped telemetry event, and performs no provider or mediator
-work. The request log is:
+`POST /auction` returns the turned-off response:
+
+- status `404`;
+- body `This endpoint is turned off`;
+- `Cache-Control: no-store, private`.
+
+The handler answers before it reads or parses the body. It emits no telemetry
+event and performs no provider or mediator work. It no longer logs
+`/auction: auction is disabled; returning no-bid response`; at `debug` level the
+request logs:
 
 ```text
-/auction: auction is disabled; returning no-bid response
+answering /auction locally with 404 because auction.enabled is off
 ```
+
+EdgeZero ingress may still buffer the request body before routing. With the
+auction on, denied consent still returns the no-bid response.
 
 ## Automated checks
 
