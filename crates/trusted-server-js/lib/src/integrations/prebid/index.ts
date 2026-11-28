@@ -9,7 +9,8 @@
 //   4. Maps parsed AuctionBids into Prebid bid response objects
 //
 // The shim on requestBids injects "trustedServer" into every ad unit so all
-// bids flow through the orchestrator.
+// bids flow through the orchestrator. While the injected config turns the
+// auction off, it removes "trustedServer" instead and sends no /auction request.
 
 import type _pbjsDefault from 'prebid.js';
 
@@ -2506,7 +2507,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
   // Shim requestBids to inject the trustedServer bidder into every ad unit
   // so plan-owned server-side bids flow through the /auction orchestrator while
-  // every unowned bidder is left untouched.
+  // every unowned bidder is left untouched. While the auction is off it injects
+  // none and removes any present.
   pbjs.requestBids = function (requestObj?: Parameters<typeof originalRequestBids>[0]) {
     log.debug('[tsjs-prebid] requestBids called');
     trySeedManagedUserIds?.();
@@ -2556,7 +2558,8 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
 
     const auctionEnabled = injectedAuctionEnabled();
 
-    // Ensure every ad unit has a trustedServer bid entry
+    // Ensure every ad unit has a trustedServer bid entry, or none while the
+    // auction is off
     for (const unit of adUnits) {
       if (!syntheticRefreshAdUnits.has(unit)) {
         const snapshot = capturePublisherAdUnitSnapshot(unit, serverSideBidders);

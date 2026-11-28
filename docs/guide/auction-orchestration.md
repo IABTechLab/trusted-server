@@ -679,9 +679,10 @@ creative TSJS; the latter retains its request-origin override for its
 foreign-origin renderer and does not inject that bundle. See
 [public origin configuration](/guide/configuration#public_origin) for the default
 authority, EC cookie scope, and coordinated upgrade/rollback warning.
-HTML/CSS returned by `/first-party/proxy` continues to be
-rewritten independently of `rewrite_creatives`; only an explicit
-`rewrite_clicks` changes its link wrapping. `[debug].inject_adm_for_testing` adds the diagnostic
+HTML/CSS returned by `/first-party/proxy` is rewritten only while that
+endpoint is on, which needs `rewrite_creatives = true`. It is still
+independent of `[auction].enabled`, and an explicit `rewrite_clicks` still
+changes its link wrapping. `[debug].inject_adm_for_testing` adds the diagnostic
 `debug_bid` blob and enables a testing-only direct GAM replacement; it does not
 control whether processed `adm` is delivered.
 

@@ -172,7 +172,10 @@ A request is protected when all of the following are true:
 
 Static assets are excluded by default using a case-insensitive file-extension regex. Trusted Server internal routes such as `/static/tsjs=`, `/integrations/`, `/first-party/`, admin routes, discovery routes, and signature-verification routes are also excluded by default.
 
-Auction traffic at `/auction` is protected by default.
+Auction traffic at `/auction` is protected by default. While
+`[auction].enabled = false`, a protected `/auction` request still goes through
+protection first. A challenge or block answers before the turned-off `404`, and
+each such request can still cost one Protection API call.
 
 ### Staging test bypass
 

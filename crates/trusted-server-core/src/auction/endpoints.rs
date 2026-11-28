@@ -95,6 +95,13 @@ const MAX_AUCTION_BODY_SIZE: usize = 256 * 1024;
 /// are enabled by default. When either is on, a bidder `<base>` loses its
 /// `href` (a `target` is kept) and creative TSJS is injected.
 ///
+/// While the auction is off ([`AuctionOrchestrator::is_enabled`] is `false`,
+/// which production sets from
+/// [`auction.enabled`][`crate::auction_config_types::AuctionConfig::enabled`]),
+/// it instead answers the turned-off `404` from
+/// [`endpoint_turned_off_response`] before it checks the body size or reads the
+/// body, and records no trace or telemetry.
+///
 /// ## Scroll, refresh, and SPA navigation
 ///
 /// This endpoint is intended for **initial page render** and **programmatic

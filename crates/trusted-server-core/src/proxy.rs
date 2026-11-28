@@ -1582,6 +1582,9 @@ async fn proxy_with_redirects(
 ///   `application/octet-stream` content type if origin omitted it, and logs likely 1×1
 ///   pixels using simple size/URL heuristics. No special response (still proxied).
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// `[auction] rewrite_creatives` is off.
+///
 /// # Errors
 ///
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
@@ -1628,9 +1631,15 @@ pub async fn handle_first_party_proxy(
 /// target URL. This avoids parsing/downloading the content and lets the browser
 /// navigate directly to the destination under first-party control.
 ///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// click wrapping is off: `[auction] rewrite_clicks`, or `rewrite_creatives`
+/// when it is unset ([`AuctionConfig::rewrites_auction_clicks`]).
+///
 /// # Errors
 ///
 /// Returns an error if the signed target cannot be reconstructed or validation fails.
+///
+/// [`AuctionConfig::rewrites_auction_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_auction_clicks
 pub async fn handle_first_party_click(
     settings: &Settings,
     _services: &RuntimeServices,
@@ -1713,6 +1722,9 @@ pub async fn handle_first_party_click(
 /// in the signature so the signed URL cannot be replayed indefinitely. Returns JSON
 /// `{ href, base }` where `href` is the signed `/first-party/proxy?...` path and `base`
 /// is the normalized clear URL.
+///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// `[auction] rewrite_creatives` is off.
 ///
 /// # Errors
 ///
@@ -1914,6 +1926,9 @@ struct ProxyRebuildResp {
 /// Body: { tsclick: "/first-party/click?tsurl=...&a=1", add: {"b":"2"}, del: ["c"] }
 /// - Only allows adding new parameters or removing existing ones.
 /// - Base tsurl cannot change.
+///
+/// Answers the turned-off `404` from [`endpoint_turned_off_response`] while
+/// click wrapping is off, the same switch as [`handle_first_party_click`].
 ///
 /// # Errors
 ///
