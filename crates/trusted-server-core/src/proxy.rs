@@ -1,5 +1,6 @@
 use crate::http_util::{
-    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, enforce_max_body_size,
+    RequestInfo, compute_encrypted_sha256_token, ct_str_eq, endpoint_turned_off_response,
+    enforce_max_body_size,
 };
 use edgezero_core::body::Body as EdgeBody;
 use edgezero_core::http::{Uri as EdgeUri, request_builder as edge_request_builder};
@@ -1589,6 +1590,13 @@ pub async fn handle_first_party_proxy(
     services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrite_creatives {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/proxy",
+            "auction.rewrite_creatives",
+        ));
+    }
+
     // Parse, reconstruct, and validate the signed target URL
     let SignedTarget { target_url, .. } =
         reconstruct_and_validate_signed_target(settings, &req.uri().to_string())?;
@@ -1628,6 +1636,13 @@ pub async fn handle_first_party_click(
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrites_auction_clicks() {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/click",
+            "auction.rewrite_clicks",
+        ));
+    }
+
     let SignedTarget {
         target_url: full_for_token,
         tsurl,
@@ -1711,6 +1726,13 @@ pub async fn handle_first_party_proxy_sign(
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrite_creatives {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/sign",
+            "auction.rewrite_creatives",
+        ));
+    }
+
     let method = req.method().clone();
     let req_url = req.uri().to_string();
     // Capture the request's own scheme before the body is consumed: a
@@ -1901,6 +1923,13 @@ pub async fn handle_first_party_proxy_rebuild(
     _services: &RuntimeServices,
     req: Request<EdgeBody>,
 ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+    if !settings.auction.rewrites_auction_clicks() {
+        return Ok(endpoint_turned_off_response(
+            "/first-party/proxy-rebuild",
+            "auction.rewrite_clicks",
+        ));
+    }
+
     let method = req.method().clone();
     let req_query = req.uri().query().unwrap_or_default().to_owned();
     // A form POST is a navigation, not a fetch: the click guard uses it when the
@@ -2280,7 +2309,9 @@ mod tests {
         ImageOptimizerCropOffsetsConfig, ImageOptimizerProfileSet, ImageOptimizerSettings,
         OriginQueryPolicy, ProxyAssetRoute, S3SigV4AuthConfig, Settings, UnknownProfilePolicy,
     };
-    use crate::test_support::tests::{crate_test_settings_str, create_test_settings};
+    use crate::test_support::tests::{
+        assert_endpoint_turned_off, crate_test_settings_str, create_test_settings,
+    };
     use bytes::Bytes;
     use edgezero_core::body::Body as EdgeBody;
     use edgezero_core::http::response_builder as edge_response_builder;
@@ -3384,6 +3415,155 @@ mod tests {
         )
     }
 
+    // Route a request to the creative endpoint handler its path names.
+    async fn call_creative_endpoint(
+        settings: &Settings,
+        req: HttpRequest<EdgeBody>,
+    ) -> Result<Response<EdgeBody>, Report<TrustedServerError>> {
+        let services = noop_services();
+        let path = req.uri().path().to_owned();
+        match path.as_str() {
+            "/first-party/proxy" => handle_first_party_proxy(settings, &services, req).await,
+            "/first-party/sign" => handle_first_party_proxy_sign(settings, &services, req).await,
+            "/first-party/click" => handle_first_party_click(settings, &services, req).await,
+            "/first-party/proxy-rebuild" => {
+                handle_first_party_proxy_rebuild(settings, &services, req).await
+            }
+            other => panic!("should name a creative endpoint, got {other}"),
+        }
+    }
+
+    #[test]
+    fn creative_endpoints_follow_their_switches() {
+        // (rewrite_creatives, rewrite_clicks, proxy and sign answer, click and rebuild answer)
+        let cases = [
+            (false, None, false, false),
+            (false, Some(true), false, true),
+            (true, Some(false), true, false),
+            (true, None, true, true),
+        ];
+
+        futures::executor::block_on(async {
+            for (rewrite_creatives, rewrite_clicks, creatives_answer, clicks_answer) in cases {
+                let mut settings = create_test_settings();
+                settings.auction.rewrite_creatives = rewrite_creatives;
+                settings.auction.rewrite_clicks = rewrite_clicks;
+                // None of these carries the input its handler needs, so a
+                // handler past its gate returns `Err`.
+                let requests = [
+                    (
+                        "GET /first-party/proxy",
+                        creatives_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/proxy"),
+                    ),
+                    (
+                        "GET /first-party/sign",
+                        creatives_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/sign"),
+                    ),
+                    (
+                        "POST /first-party/sign",
+                        creatives_answer,
+                        build_http_post_json_request(
+                            "https://edge.example/first-party/sign",
+                            &serde_json::json!({}),
+                        ),
+                    ),
+                    (
+                        "GET /first-party/click",
+                        clicks_answer,
+                        build_http_request(Method::GET, "https://edge.example/first-party/click"),
+                    ),
+                    (
+                        "GET /first-party/proxy-rebuild",
+                        clicks_answer,
+                        build_http_request(
+                            Method::GET,
+                            "https://edge.example/first-party/proxy-rebuild",
+                        ),
+                    ),
+                    (
+                        "POST /first-party/proxy-rebuild",
+                        clicks_answer,
+                        build_http_post_json_request(
+                            "https://edge.example/first-party/proxy-rebuild",
+                            &serde_json::json!({}),
+                        ),
+                    ),
+                ];
+
+                for (request, answers, req) in requests {
+                    let label = format!(
+                        "{request} with rewrite_creatives={rewrite_creatives} rewrite_clicks={rewrite_clicks:?}"
+                    );
+                    let result = call_creative_endpoint(&settings, req).await;
+                    if answers {
+                        assert!(
+                            result.is_err(),
+                            "{label}: should pass the gate, got {result:?}"
+                        );
+                    } else {
+                        let response = result.unwrap_or_else(|error| {
+                            panic!("{label}: should answer locally: {error:?}")
+                        });
+                        assert_endpoint_turned_off(response, &label);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn turned_off_creative_endpoints_ignore_valid_signatures() {
+        futures::executor::block_on(async {
+            let mut settings = create_test_settings();
+            settings.auction.rewrite_creatives = false;
+            settings.auction.rewrite_clicks = None;
+            let tsurl = "https://cdn.example/pixel.png";
+            let token = crate::http_util::compute_encrypted_sha256_token(&settings, tsurl);
+            let signed_proxy = format!(
+                "https://edge.example/first-party/proxy?tsurl={}&tstoken={token}",
+                url::form_urlencoded::byte_serialize(tsurl.as_bytes()).collect::<String>(),
+            );
+            let signed_rebuild = format!(
+                "https://edge.example/first-party/proxy-rebuild?tsclick={}",
+                url::form_urlencoded::byte_serialize(signed_click_target(&settings).as_bytes())
+                    .collect::<String>(),
+            );
+            let unparsable_sign = HttpRequest::builder()
+                .method(Method::POST)
+                .uri("https://edge.example/first-party/sign")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(EdgeBody::from("not json"))
+                .expect("should build sign request with a body that is not JSON");
+            let requests = [
+                (
+                    "signed GET /first-party/proxy",
+                    build_http_request(Method::GET, signed_proxy),
+                ),
+                (
+                    "signed GET /first-party/click",
+                    build_http_request(Method::GET, signed_click_target(&settings)),
+                ),
+                (
+                    "signed GET /first-party/proxy-rebuild",
+                    build_http_request(Method::GET, signed_rebuild),
+                ),
+                (
+                    "POST /first-party/sign with a body that is not JSON",
+                    unparsable_sign,
+                ),
+            ];
+
+            for (label, req) in requests {
+                let response = call_creative_endpoint(&settings, req)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: should answer locally: {error:?}"));
+                assert_endpoint_turned_off(response, label);
+            }
+        });
+    }
+
     #[test]
     fn proxied_responses_strip_upstream_cors_policy() {
         // Emitting no header of our own is not enough: the buffered path
@@ -3979,51 +4159,6 @@ mod tests {
         let body = response_body_string(out);
         assert!(body.contains("/first-party/proxy?tsurl="), "{}", body);
         assert_eq!(ct, "text/css; charset=utf-8");
-    }
-
-    #[test]
-    fn auction_rewrite_setting_does_not_change_proxied_html_or_css_rewriting() {
-        let mut settings = create_test_settings();
-        settings.auction.rewrite_creatives = false;
-        let req = build_http_request(Method::GET, "https://edge.example/first-party/proxy");
-
-        let html = r#"<html><body><img src="https://cdn.example/ad.png"></body></html>"#;
-        let mut html_response = build_http_response(StatusCode::OK, EdgeBody::from(html));
-        html_response.headers_mut().insert(
-            header::CONTENT_TYPE,
-            HeaderValue::from_static("text/html; charset=utf-8"),
-        );
-        let html_output = finalize(
-            &settings,
-            &req,
-            "https://cdn.example/creative.html",
-            html_response,
-        )
-        .expect("should finalize proxied HTML");
-        let html_body = response_body_string(html_output);
-
-        let css = "body{background:url(https://cdn.example/bg.png)}";
-        let mut css_response = build_http_response(StatusCode::OK, EdgeBody::from(css));
-        css_response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static("text/css"));
-        let css_output = finalize(
-            &settings,
-            &req,
-            "https://cdn.example/creative.css",
-            css_response,
-        )
-        .expect("should finalize proxied CSS");
-        let css_body = response_body_string(css_output);
-
-        assert!(
-            html_body.contains("/first-party/proxy?tsurl="),
-            "should keep rewriting proxied HTML when auction rewriting is disabled: {html_body}"
-        );
-        assert!(
-            css_body.contains("/first-party/proxy?tsurl="),
-            "should keep rewriting proxied CSS when auction rewriting is disabled: {css_body}"
-        );
     }
 
     #[test]

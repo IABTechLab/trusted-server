@@ -1168,9 +1168,11 @@ pub fn rewrite_creative_html(settings: &Settings, markup: &str) -> String {
 /// 1 MiB. The creative runtime is always injected; its click guard acts only
 /// on links wrapped by this pass.
 ///
-/// Asset rewriting here is unconditional. Click wrapping follows an explicit
-/// `[auction] rewrite_clicks`; when that is unset, links keep being wrapped
-/// regardless of `rewrite_creatives`.
+/// This pass runs only while `/first-party/proxy` is on
+/// (`[auction] rewrite_creatives = true`), and it always rewrites assets.
+/// Click wrapping follows [`AuctionConfig::rewrites_proxied_clicks`].
+///
+/// [`AuctionConfig::rewrites_proxied_clicks`]: crate::auction_config_types::AuctionConfig::rewrites_proxied_clicks
 #[must_use]
 pub fn rewrite_proxied_html(settings: &Settings, markup: &str) -> String {
     rewrite_creative_html_impl(

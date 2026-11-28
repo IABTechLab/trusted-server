@@ -3,8 +3,13 @@ pub(crate) mod logging;
 
 #[cfg(test)]
 pub mod tests {
+    use edgezero_core::body::Body as EdgeBody;
+    use http::{Response, StatusCode, header};
+
     use crate::consent::jurisdiction::Jurisdiction;
     use crate::consent::types::{ConsentContext, ConsentSource, TcfConsent};
+    use crate::http_util::ENDPOINT_TURNED_OFF_BODY;
+    use crate::response_privacy::TerminalPrivateResponse;
     use crate::settings::Settings;
 
     #[must_use]
@@ -94,6 +99,57 @@ pub mod tests {
             source: ConsentSource::Cookie,
             ..ConsentContext::default()
         }
+    }
+
+    /// Asserts that `response` is the local `404` of a turned-off endpoint.
+    ///
+    /// Checks the status, the exact [`ENDPOINT_TURNED_OFF_BODY`],
+    /// `Content-Type`, `Cache-Control: no-store, private` and the
+    /// [`TerminalPrivateResponse`] marker that
+    /// [`crate::http_util::endpoint_turned_off_response`] sets. Every message
+    /// names `label`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when any of those differ, or when the body is a stream.
+    pub(crate) fn assert_endpoint_turned_off(response: Response<EdgeBody>, label: &str) {
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{label}: should answer 404 while turned off"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8"),
+            "{label}: should answer plain text while turned off"
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store, private"),
+            "{label}: should keep the turned-off answer out of every cache"
+        );
+        assert!(
+            response
+                .extensions()
+                .get::<TerminalPrivateResponse>()
+                .is_some(),
+            "{label}: should mark the turned-off answer terminal-private"
+        );
+        let body = response
+            .into_body()
+            .into_bytes()
+            .unwrap_or_else(|| panic!("{label}: should buffer the turned-off body"));
+        assert_eq!(
+            body.as_ref(),
+            ENDPOINT_TURNED_OFF_BODY.as_bytes(),
+            "{label}: should answer the turned-off body"
+        );
     }
 }
 
