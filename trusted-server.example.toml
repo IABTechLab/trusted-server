@@ -326,6 +326,9 @@ allowed_context_keys = []
 
 # Example server-side provider declarations. Remove or customize before enabling auctions.
 [auction.providers.pbs-main]
+# Remote Prebid Server execution is also the default when this field is omitted.
+# Internal execution = "auctioneer" is rejected until the artifact includes it.
+execution = "remote"
 protocol = "openrtb-2.6"
 profile = "prebid-server"
 endpoint = "https://prebid.example.com/openrtb2/auction"

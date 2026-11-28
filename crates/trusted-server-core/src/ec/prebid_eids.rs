@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::{Eid, Uid, uid_extension};
 
 use super::kv::PartnerIdUpdate;
 use super::kv_types::MAX_UID_LENGTH;
@@ -194,19 +194,22 @@ fn collect_prebid_eid_updates_from_eids(
 ) -> Vec<PartnerIdUpdate> {
     let mut updates = Vec::new();
     for eid in eids {
-        let Some(partner) = registry.find_by_source_domain(&eid.source) else {
-            log::debug!("Prebid EIDs: no partner for source '{}'", eid.source);
+        let Some(source) = eid.source.as_deref() else {
+            continue;
+        };
+        let Some(partner) = registry.find_by_source_domain(source) else {
+            log::debug!("Prebid EIDs: no partner for source '{}'", source);
             continue;
         };
 
         // KV stores one UID per partner. Preserve the previous cookie-ingestion
         // behavior by syncing the first valid UID under each source, while
         // skipping malformed candidates instead of dropping the whole source.
-        let Some(uid) = first_valid_uid(&eid.uids) else {
+        let Some(uid) = first_valid_uid(eid.uids.as_deref().unwrap_or_default()) else {
             log::debug!(
                 "Prebid EIDs: no valid uid for source_domain '{}' from source '{}'",
                 partner.source_domain,
-                eid.source,
+                source,
             );
             continue;
         };
@@ -295,8 +298,9 @@ fn structured_cookie_eids_to_openrtb(entries: Vec<StructuredCookieEid>) -> Vec<E
         }
 
         eids.push(Eid {
-            source: entry.source,
-            uids,
+            source: Some(entry.source),
+            uids: Some(uids),
+            ..Default::default()
         });
     }
 
@@ -309,15 +313,17 @@ fn structured_cookie_uid_to_openrtb(uid: StructuredCookieUid) -> Option<Uid> {
     }
 
     let atype = uid.atype.filter(|atype| *atype >= 0);
-    let ext = match uid.ext {
-        Some(JsonValue::Object(_)) => uid.ext,
-        _ => None,
-    };
+    let ext = uid
+        .ext
+        .as_ref()
+        .filter(|value| value.is_object())
+        .and_then(uid_extension);
 
     Some(Uid {
         id: uid.id,
         atype,
         ext,
+        ..Default::default()
     })
 }
 
@@ -326,12 +332,14 @@ fn legacy_cookie_eids_to_openrtb(entries: Vec<LegacyCookieEid>) -> Vec<Eid> {
         .into_iter()
         .filter(|entry| !entry.source.is_empty() && !entry.id.is_empty())
         .map(|entry| Eid {
-            source: entry.source,
-            uids: vec![Uid {
+            source: Some(entry.source),
+            uids: Some(vec![Uid {
                 id: entry.id,
                 atype: (entry.atype >= 0).then_some(entry.atype),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         })
         .collect()
 }
@@ -388,16 +396,50 @@ mod tests {
 
         let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
         assert_eq!(decoded.len(), 3, "should parse all EIDs");
-        assert_eq!(decoded[0].source, "id5-sync.com");
-        assert_eq!(decoded[0].uids[0].id, "ID5_abc");
-        assert_eq!(decoded[1].source, "liveramp.com");
-        assert_eq!(decoded[1].uids[0].id, "LR_xyz");
         assert_eq!(
-            decoded[2].source, "google.com",
+            decoded[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "id5-sync.com"
+        );
+        assert_eq!(
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "ID5_abc"
+        );
+        assert_eq!(
+            decoded[1]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "liveramp.com"
+        );
+        assert_eq!(
+            decoded[1]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "LR_xyz"
+        );
+        assert_eq!(
+            decoded[2]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "google.com",
             "should preserve PAIR source"
         );
         assert_eq!(
-            decoded[2].uids[0].atype,
+            decoded[2]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(571187),
             "should preserve PAIR vendor-specific atype"
         );
@@ -417,17 +459,57 @@ mod tests {
 
         let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode valid payload");
         assert_eq!(decoded.len(), 1, "should parse one structured EID entry");
-        assert_eq!(decoded[0].source, "sharedid.org");
-        assert_eq!(decoded[0].uids.len(), 3, "should preserve multiple UIDs");
-        assert_eq!(decoded[0].uids[0].id, "shared_123");
-        assert_eq!(decoded[0].uids[0].atype, Some(3));
         assert_eq!(
-            decoded[0].uids[1].ext,
+            decoded[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "sharedid.org"
+        );
+        assert_eq!(
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            3,
+            "should preserve multiple UIDs"
+        );
+        assert_eq!(
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "shared_123"
+        );
+        assert_eq!(
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
+            Some(3)
+        );
+        assert_eq!(
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[1]
+                .ext
+                .as_ref()
+                .map(|extension| serde_json::to_value(extension)
+                    .expect("should serialize UID extension")),
             Some(json!({"provider": "example"})),
             "should preserve UID ext objects"
         );
         assert_eq!(
-            decoded[0].uids[2].atype, None,
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[2]
+                .atype,
+            None,
             "should drop negative atype values"
         );
     }
@@ -444,7 +526,11 @@ mod tests {
         let decoded = parse_prebid_eids_cookie(&encoded).expect("should decode PAIR EID");
 
         assert_eq!(
-            decoded[0].uids[0].atype,
+            decoded[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(571187),
             "should preserve PAIR's vendor-specific atype"
         );
@@ -516,11 +602,13 @@ mod tests {
                 id: oversized,
                 atype: Some(1),
                 ext: None,
+                ..Default::default()
             },
             Uid {
                 id: "valid-uid".to_owned(),
                 atype: Some(1),
                 ext: None,
+                ..Default::default()
             },
         ];
 
@@ -534,6 +622,7 @@ mod tests {
             id: "   ".to_owned(),
             atype: Some(1),
             ext: None,
+            ..Default::default()
         }];
 
         assert!(
@@ -637,20 +726,24 @@ mod tests {
         ]));
         let body_eids = vec![
             Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![Uid {
+                source: Some("id5-sync.com".to_owned()),
+                uids: Some(vec![Uid {
                     id: "ID5_fresh".to_owned(),
                     atype: Some(1),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![Uid {
+                source: Some("liveramp.com".to_owned()),
+                uids: Some(vec![Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
         ];
 

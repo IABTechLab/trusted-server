@@ -154,6 +154,44 @@ mod tests {
         settings
     }
 
+    #[test]
+    fn execution_selection_blob_preserves_remote_and_refuses_internal() {
+        for execution in ["remote", "auctioneer"] {
+            let mut data =
+                serde_json::to_value(test_settings()).expect("should serialize test settings");
+            data["auction"]["providers"] = serde_json::json!({"pbs-main": {
+                "execution": execution, "protocol": "openrtb-2.6",
+                "profile": "prebid-server", "endpoint": "https://prebid.example.com/auction"
+            }});
+            let envelope = BlobEnvelope::new(data, "2026-01-01T00:00:00Z".to_owned());
+            let encoded = serde_json::to_string(&envelope)
+                .expect("should encode an integrity-valid envelope");
+            let result = settings_from_config_blob(
+                &encoded,
+                &EchoSecretStore,
+                &StoreName::from("ts_secrets"),
+            );
+            if execution == "remote" {
+                let settings =
+                    result.expect("should load explicit remote execution from a verified blob");
+                let serialized = serde_json::to_value(settings).expect("should serialize settings");
+                assert!(
+                    serialized["auction"]["providers"]["pbs-main"]
+                        .get("execution")
+                        .is_none(),
+                    "should normalize remote execution through the real blob extraction path"
+                );
+            } else {
+                let error = result
+                    .expect_err("should reject unavailable internal execution in a verified blob");
+                assert!(
+                    format!("{error:?}").contains("AuctioneerUnavailable"),
+                    "should preserve the engine-unavailable diagnostic through blob extraction: {error:?}"
+                );
+            }
+        }
+    }
+
     struct EchoSecretStore;
 
     #[async_trait::async_trait(?Send)]

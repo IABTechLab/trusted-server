@@ -10,6 +10,7 @@ import {
 } from '../trace/runtime';
 
 import { log } from './log';
+import { parseBidTargeting } from './targeting';
 import type { ApsRendererV1 } from './types';
 
 // ---------------------------------------------------------------------------
@@ -49,6 +50,8 @@ export interface AdRequest {
 
 /** A parsed bid from an OpenRTB seatbid response. */
 export interface AuctionBid {
+  /** Finalized targeting from the selected server-side bid. */
+  targeting?: Record<string, string>;
   /** Matches the `impid` in the response — corresponds to adUnit `code`. */
   impid: string;
   /** Creative HTML (already rewritten with proxy URLs by the server). */
@@ -149,8 +152,10 @@ export function parseAuctionResponse(body: any): AuctionBid[] {
       const creativeId =
         typeof bid?.crid === 'string' ? bid.crid : (renderer?.creativeId ?? `${seat}-${impid}`);
 
+      const targeting = parseBidTargeting(bid?.ext?.prebid?.targeting);
       bids.push({
         impid,
+        ...(targeting ? { targeting } : {}),
         // Preserve non-string untrusted values so the render-time sanitizer
         // rejects them explicitly instead of silently converting them to an
         // empty no-op creative.

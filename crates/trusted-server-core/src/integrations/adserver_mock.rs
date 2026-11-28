@@ -841,7 +841,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_mediation_response_restores_original_bid_render_fields() {
+    fn openrtb_shared_types_admission_mediator_restores_original_bid_render_fields() {
         let provider = AdServerMockProvider::new(AdServerMockConfig::default());
         let mediation_response = json!({
             "id": "test-auction-123",
@@ -955,6 +955,84 @@ mod tests {
             bid.returned_seat.as_deref(),
             Some("upstream-seat"),
             "should restore returned seat only from the matched original bid"
+        );
+
+        let sibling_response = json!({
+            "id": "unrelated-response",
+            "seatbid": [{"seat": "prebid", "bid": [{
+                "id": null,
+                "impid": "header-banner",
+                "adm": "<script>do-not-forward</script>",
+                "w": 728,
+                "h": 90,
+                "crid": "mocktioneer-creative",
+                "adomain": ["example.com"],
+                "nurl": "https://untrusted.example/win",
+                "ext": {"unknown": {"private": "do-not-forward"}}
+            }, {
+                "id": "malformed-dimensions",
+                "impid": "header-banner",
+                "price": 99.0,
+                "w": 0,
+                "h": 90,
+                "crid": "mocktioneer-creative"
+            }]}]
+        });
+        let parsed = provider.parse_mediation_response(&sibling_response, 42, &bid_index, None);
+
+        assert_eq!(
+            parsed.status,
+            BidStatus::Success,
+            "should retain the valid mediator sibling"
+        );
+        assert_eq!(
+            parsed.bids.len(),
+            1,
+            "should reject only the malformed dimensions"
+        );
+        assert_eq!(
+            parsed.bids[0].returned_seat.as_deref(),
+            Some("upstream-seat"),
+            "should restore the original upstream seat"
+        );
+        assert_eq!(
+            serde_json::to_value(&parsed.bids).expect("should serialize mediated bids"),
+            json!([{
+                "slot_id": "header-banner",
+                "price": null,
+                "currency": "USD",
+                "creative": null,
+                "adomain": ["example.com"],
+                "bidder": "mocktioneer",
+                "width": 728,
+                "height": 90,
+                "nurl": "https://ssp.example/win",
+                "burl": "https://ssp.example/bill",
+                "bid_id": "source-bid-id",
+                "ad_id": "bid-impression-id",
+                "creative_id": "source-creative-id",
+                "renderer": {
+                    "type": "aps",
+                    "version": 1,
+                    "accountId": "example-account",
+                    "bidId": "source-bid-id",
+                    "creativeId": "source-creative-id",
+                    "tagType": "iframe",
+                    "creativeUrl": "https://creative.example/render",
+                    "aaxResponse": "fictional-base64",
+                    "width": 728,
+                    "height": 90
+                },
+                "cache_id": "cache-uuid",
+                "cache_host": "cache.example",
+                "cache_path": "/cache",
+                "metadata": {}
+            }]),
+            "should preserve omitted price, fallback identity and all source-owned render fields"
+        );
+        assert!(
+            parsed.metadata.is_empty(),
+            "should not forward mediator extensions"
         );
     }
 
@@ -1440,7 +1518,7 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_mediation_response_accepts_u32_max_dimensions() {
+    fn openrtb_shared_types_admission_mediator_accepts_u32_max_dimensions() {
         // u32::MAX is the largest representable dimension and must be accepted,
         // pinning the upper boundary of the oversized-dimension check.
         let config = AdServerMockConfig::default();

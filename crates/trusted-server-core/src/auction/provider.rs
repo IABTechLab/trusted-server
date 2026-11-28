@@ -361,14 +361,10 @@ impl GenericOpenRtbProvider {
                 input: input.clone(),
             },
             CompiledOpenRtbProfile::PrebidServer(_) => {
-                debug_assert!(
-                    request.imp.iter().all(|impression| impression.id.is_some()),
-                    "should populate every PBS impression ID"
-                );
                 let sent_impression_ids = request
                     .imp
                     .iter()
-                    .filter_map(|impression| impression.id.as_deref())
+                    .map(|impression| impression.id.as_str())
                     .collect::<HashSet<_>>();
                 GenericOpenRtbParseState::Prebid {
                     provider_id: self.provider_name().to_string(),

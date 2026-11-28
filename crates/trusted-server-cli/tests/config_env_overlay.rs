@@ -613,6 +613,60 @@ fn map_config_rejects_invalid_rewrite_creatives_environment_override() {
 }
 
 #[test]
+fn execution_selection_environment_overlay_normalizes_remote_and_refuses_internal() {
+    const EXECUTION_ENV: &str = "TRUSTED_SERVER__AUCTION__PROVIDERS__PBS-MAIN__EXECUTION";
+    let project = migrated_project();
+    let mut document = fs::read_to_string(&project.config_path)
+        .expect("should read config")
+        .parse::<DocumentMut>()
+        .expect("should parse config");
+    // The actual EdgeZero overlay requires an existing leaf.
+    document["auction"]["providers"]["pbs-main"]["execution"] = value("remote");
+    fs::write(&project.config_path, document.to_string())
+        .expect("should write explicit remote config");
+    let auction = pushed_auction_with_env(&project, EXECUTION_ENV, "remote");
+    assert!(
+        auction["providers"]["pbs-main"].get("execution").is_none(),
+        "should push the unchanged remote schema after environment overlay"
+    );
+    let store = project
+        .directory
+        .path()
+        .join(".edgezero/local-config-trusted_server_config.json");
+    let previous = fs::read(&store).expect("should read the remote configuration store");
+    for operation in ["validate", "push"] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_ts"));
+        command
+            .args(["config", operation, "--manifest"])
+            .arg(&project.manifest_path)
+            .arg("--app-config")
+            .arg(&project.config_path)
+            .current_dir(project.directory.path())
+            .env(EXECUTION_ENV, "auctioneer");
+        if operation == "push" {
+            command.args(["--adapter", "axum", "--yes", "--no-diff"]);
+        }
+        let output = command
+            .output()
+            .expect("should run the real CLI with an execution overlay");
+        assert!(
+            !output.status.success(),
+            "should refuse internal execution during {operation}"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("AuctioneerUnavailable"),
+            "should retain an actionable execution diagnostic during {operation}: {stderr}"
+        );
+        assert_eq!(
+            fs::read(&store).expect("should retain the existing config store"),
+            previous,
+            "should preserve the remote configuration after a refused {operation}"
+        );
+    }
+}
+
+#[test]
 fn map_shaped_provider_and_bidder_environment_overlays_apply() {
     let project = migrated_project();
     let output = Command::new(env!("CARGO_BIN_EXE_ts"))

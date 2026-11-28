@@ -427,3 +427,65 @@ describe('auction/sendAuction', () => {
     expect(bids).toEqual([]);
   });
 });
+
+describe('auctioneer targeting response carrier', () => {
+  function response(targeting?: unknown) {
+    return {
+      seatbid: [
+        {
+          seat: 'fictional-seat',
+          bid: [
+            {
+              impid: 'example-slot',
+              price: 1.234,
+              adm: '<div>Example</div>',
+              ext: { prebid: { targeting } },
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  it('preserves exact selected keys independently for valid siblings', () => {
+    const first = JSON.parse(
+      '{"custom_pb":"1.234","custom_bidder":"fictional","custom_deal":"deal-1","custom_size":"300x250","custom_format":"banner","custom_empty":"","__proto__":"literal"}'
+    );
+    const second = { hb_pb: '0.00', hb_bidder: 'other-seat' };
+    const body = response(first);
+    body.seatbid[0].bid.push({
+      ...body.seatbid[0].bid[0],
+      impid: 'other-slot',
+      ext: { prebid: { targeting: second } },
+    });
+    const bids = parseAuctionResponse(body);
+    expect(bids.map((bid) => bid.targeting)).toEqual([first, second]);
+    expect(bids[0].targeting).not.toBe(first);
+    expect(Object.getPrototypeOf(bids[0].targeting)).toBe(Object.prototype);
+    expect(Object.prototype.hasOwnProperty.call(bids[0].targeting!, '__proto__')).toBe(true);
+    expect(bids[0].price).toBe(1.234);
+  });
+
+  it.each([
+    undefined,
+    null,
+    false,
+    7,
+    'opaque',
+    ['opaque'],
+    { custom_pb: 1 },
+    { custom_pb: '1.00', invalid: [] },
+  ])('ignores malformed targeting without dropping the admitted bid: %j', (targeting) => {
+    const bids = parseAuctionResponse(response(targeting));
+    expect(bids).toHaveLength(1);
+    expect(bids[0]).not.toHaveProperty('targeting');
+    expect(bids[0].adm).toBe('<div>Example</div>');
+    expect(bids[0].price).toBe(1.234);
+  });
+
+  it('copies only own string properties and preserves an explicit empty map', () => {
+    const targeting = Object.assign(Object.create({ inherited: 'ignore' }), { custom_pb: '1.00' });
+    expect(parseAuctionResponse(response(targeting))[0].targeting).toEqual({ custom_pb: '1.00' });
+    expect(parseAuctionResponse(response({}))[0].targeting).toEqual({});
+  });
+});

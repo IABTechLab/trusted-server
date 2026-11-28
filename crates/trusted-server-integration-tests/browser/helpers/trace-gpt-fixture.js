@@ -1,4 +1,7 @@
 ;(() => {
+  const creativeOrigin =
+    window.__traceGptFixtureConfig?.creativeOrigin ||
+    'https://creative.example.com'
   const slots = new Map()
   const listeners = new Map()
   const requests = []
@@ -7,6 +10,19 @@
   function emit(name, slot, facts = {}) {
     for (const listener of listeners.get(name) || [])
       listener({ slot, ...facts })
+  }
+
+  function requestSlots(selected) {
+    for (const slot of selected) {
+      if (slots.get(slot.getSlotElementId()) !== slot) continue
+      requests.push({
+        slot,
+        targeting: Object.fromEntries(
+          slot.getTargetingKeys().map((key) => [key, slot.getTargeting(key)])
+        ),
+      })
+      emit('slotRequested', slot)
+    }
   }
 
   const service = {
@@ -38,16 +54,7 @@
       return service
     },
     refresh(selected = [...slots.values()]) {
-      for (const slot of selected) {
-        if (slots.get(slot.getSlotElementId()) !== slot) continue
-        requests.push({
-          slot,
-          targeting: Object.fromEntries(
-            slot.getTargetingKeys().map((key) => [key, slot.getTargeting(key)])
-          ),
-        })
-        emit('slotRequested', slot)
-      }
+      requestSlots(selected)
     },
   }
 
@@ -110,7 +117,7 @@
           ? target
           : target.getSlotElementId?.() || target.id
       const slot = slots.get(id)
-      if (slot && !initialLoadDisabled) service.refresh([slot])
+      if (slot && !initialLoadDisabled) requestSlots([slot])
     },
     getConfig: () => ({ disableInitialLoad: initialLoadDisabled }),
     setConfig(config) {
@@ -131,7 +138,7 @@
         const frame = document.createElement('iframe')
         frame.width = '300'
         frame.height = '250'
-        frame.src = `https://creative.example.com/fixture-puc?adId=${encodeURIComponent(adId)}`
+        frame.src = `${creativeOrigin}/fixture-puc?adId=${encodeURIComponent(adId)}`
         document
           .getElementById(request.slot.getSlotElementId())
           .replaceChildren(frame)

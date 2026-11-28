@@ -1,6 +1,9 @@
 //! Auction configuration types shared by settings and auction planning.
 
-use serde::de::{Error as _, MapAccess, SeqAccess, Visitor, value::MapAccessDeserializer};
+use serde::de::{
+    DeserializeSeed, Error as _, IntoDeserializer as _, MapAccess, SeqAccess, Visitor,
+    value::MapAccessDeserializer,
+};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
@@ -116,7 +119,12 @@ impl Default for AuctionConfig {
     }
 }
 
-fn deserialize_provider_map<'de, D>(
+/// Decode provider execution consistently for settings and direct plans.
+///
+/// # Errors
+///
+/// Rejects invalid remote declarations and unavailable internal execution.
+pub(crate) fn deserialize_provider_map<'de, D>(
     deserializer: D,
 ) -> Result<BTreeMap<ProviderId, ProviderConfig>, D::Error>
 where
@@ -131,11 +139,15 @@ where
             formatter.write_str("a map of auction provider IDs to provider configurations")
         }
 
-        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
         where
             A: MapAccess<'de>,
         {
-            Self::Value::deserialize(MapAccessDeserializer::new(map))
+            let mut providers = BTreeMap::new();
+            while let Some((id, declaration)) = map.next_entry::<ProviderId, DecodedProvider>()? {
+                providers.insert(id, declaration.0);
+            }
+            Ok(providers)
         }
 
         fn visit_seq<A>(self, _sequence: A) -> Result<Self::Value, A::Error>
@@ -148,6 +160,102 @@ where
 
     deserializer.deserialize_any(ProviderMapVisitor)
 }
+
+// This wire-only discriminator recognizes unavailable execution without retaining
+// a substitute for Auctioneer's shared policy type.
+#[derive(Deserialize)]
+#[serde(tag = "execution", rename_all = "snake_case")]
+enum ProviderDeclaration {
+    Remote(ProviderConfig),
+    Auctioneer,
+}
+
+// Forward original values to Serde so nested typed fields retain duplicate-key
+// checks. Append the legacy default only after all authored keys are consumed.
+struct DefaultRemoteExecution<A> {
+    map: A,
+    execution_seen: bool,
+    default_value_pending: bool,
+}
+
+impl<'de, A> MapAccess<'de> for DefaultRemoteExecution<A>
+where
+    A: MapAccess<'de>,
+{
+    type Error = A::Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>, Self::Error>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        let key = match self.map.next_key::<String>()? {
+            Some(key) => {
+                self.execution_seen |= key == "execution";
+                key
+            }
+            None if !self.execution_seen => {
+                self.execution_seen = true;
+                self.default_value_pending = true;
+                "execution".to_owned()
+            }
+            None => return Ok(None),
+        };
+        seed.deserialize(key.into_deserializer()).map(Some)
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value, Self::Error>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        if self.default_value_pending {
+            self.default_value_pending = false;
+            seed.deserialize("remote".into_deserializer())
+        } else {
+            self.map.next_value_seed(seed)
+        }
+    }
+}
+
+fn deserialize_provider_declaration<'de, D>(deserializer: D) -> Result<ProviderConfig, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct DeclarationVisitor;
+
+    impl<'de> Visitor<'de> for DeclarationVisitor {
+        type Value = ProviderConfig;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("an auction provider declaration")
+        }
+
+        fn visit_map<A>(self, map: A) -> Result<Self::Value, A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let declaration = ProviderDeclaration::deserialize(MapAccessDeserializer::new(
+                DefaultRemoteExecution {
+                    map,
+                    execution_seen: false,
+                    default_value_pending: false,
+                },
+            ))?;
+            match declaration {
+                ProviderDeclaration::Remote(provider) => Ok(provider),
+                ProviderDeclaration::Auctioneer => Err(A::Error::custom(
+                    "AuctioneerUnavailable: this Trusted Server artifact does not include internal Auctioneer execution",
+                )),
+            }
+        }
+    }
+
+    deserializer.deserialize_map(DeclarationVisitor)
+}
+
+#[derive(Deserialize)]
+struct DecodedProvider(
+    #[serde(deserialize_with = "deserialize_provider_declaration")] ProviderConfig,
+);
 
 fn default_timeout() -> u32 {
     2000
@@ -397,6 +505,182 @@ mod tests {
             error.to_string().contains("map") || error.to_string().contains("object"),
             "should require map-shaped providers: {error}"
         );
+    }
+
+    fn remote_provider() -> serde_json::Value {
+        serde_json::json!({
+            "protocol": "openrtb-2.6",
+            "profile": "prebid-server",
+            "endpoint": "https://prebid.example.com/openrtb2/auction",
+            "timeout_ms": 850,
+            "routing": "explicit",
+            "notifications": {"suppress_all": true, "suppress_seats": ["example-seat"]},
+            "profile_config": {"debug": false, "test_mode": true}
+        })
+    }
+
+    #[test]
+    fn execution_selection_remote_preserves_legacy_serialization_and_plan() {
+        let mut provider = remote_provider();
+        let legacy: AuctionConfig = serde_json::from_value(serde_json::json!({
+            "providers": {"pbs-main": provider.clone()}
+        }))
+        .expect("should parse the legacy remote declaration");
+        provider["execution"] = serde_json::json!("remote");
+        let explicit: AuctionConfig = serde_json::from_value(serde_json::json!({
+            "providers": {"pbs-main": provider.clone()}
+        }))
+        .expect("should accept explicit remote execution");
+        let legacy_wire = serde_json::to_value(legacy).expect("should serialize legacy config");
+        let explicit_wire = serde_json::to_value(explicit).expect("should serialize remote config");
+        assert_eq!(
+            explicit_wire, legacy_wire,
+            "should preserve the existing remote wire shape"
+        );
+        assert!(
+            explicit_wire["providers"]["pbs-main"]
+                .get("execution")
+                .is_none(),
+            "should omit the normalized remote discriminator"
+        );
+
+        let plan: crate::auction::plan::AuctionPlanConfig =
+            serde_json::from_value(serde_json::json!({
+                "timeout_ms": 1000, "providers": {"pbs-main": provider}
+            }))
+            .expect("should accept the same selection at the direct plan boundary");
+        let compiled = crate::auction::plan::AuctionPlan::compile(plan)
+            .expect("should compile the existing remote provider");
+        assert_eq!(
+            compiled.providers().len(),
+            1,
+            "should retain the remote provider"
+        );
+    }
+
+    #[test]
+    fn execution_selection_toml_accepts_remote_and_refuses_internal() {
+        let remote = r#"
+[providers.pbs-main]
+execution = "remote"
+protocol = "openrtb-2.6"
+profile = "prebid-server"
+endpoint = "https://prebid.example.com/openrtb2/auction"
+"#;
+        let config: AuctionConfig =
+            toml::from_str(remote).expect("should accept explicit remote execution in TOML");
+        let serialized = toml::to_string(&config).expect("should serialize remote TOML");
+        assert!(
+            !serialized.contains("execution"),
+            "should omit normalized remote execution"
+        );
+        let internal = r#"
+[providers.local]
+execution = "auctioneer"
+auctioneer = false
+account = "invalid"
+artifact_identity = 42
+"#;
+        let error = toml::from_str::<AuctionConfig>(internal)
+            .expect_err("should refuse unavailable internal execution before policy validation");
+        assert!(
+            error.to_string().contains("AuctioneerUnavailable"),
+            "should identify unavailable engine support: {error}"
+        );
+    }
+
+    #[test]
+    fn execution_selection_internal_refusal_precedes_branch_field_validation() {
+        let fields = serde_json::to_string(&serde_json::json!({
+            "protocol": 42, "routing": "all_eligible", "auctioneer": false,
+            "account": "invalid", "artifact_identity": 42
+        }))
+        .expect("should encode intentionally invalid branch fields");
+        let fields = fields.trim_start_matches('{').trim_end_matches('}');
+        let discriminator = r#""execution":"auctioneer""#;
+        for declaration in [
+            format!("{{{discriminator},{fields}}}"),
+            format!("{{{fields},{discriminator}}}"),
+        ] {
+            let input = format!(r#"{{"providers":{{"local":{declaration}}}}}"#);
+            let error = serde_json::from_str::<AuctionConfig>(&input)
+                .expect_err("should refuse the unavailable engine in either field order");
+            assert!(
+                error.to_string().contains("AuctioneerUnavailable"),
+                "should select execution before typed branch decoding: {error}"
+            );
+            let input = format!(r#"{{"timeout_ms":1000,"providers":{{"local":{declaration}}}}}"#);
+            let error = serde_json::from_str::<crate::auction::plan::AuctionPlanConfig>(&input)
+                .expect_err("should refuse the unavailable engine at the direct plan boundary");
+            assert!(
+                error.to_string().contains("AuctioneerUnavailable"),
+                "should share execution refusal with direct plans: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_selection_rejects_unknown_or_non_string_modes() {
+        for execution in [
+            serde_json::json!("unknown"),
+            serde_json::json!("Remote"),
+            serde_json::json!(null),
+            serde_json::json!(42),
+            serde_json::json!(false),
+            serde_json::json!([]),
+        ] {
+            let mut provider = remote_provider();
+            provider["execution"] = execution.clone();
+            let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
+                "providers": {"pbs-main": provider}
+            }))
+            .expect_err("should reject invalid execution selection");
+            assert!(
+                !error.to_string().contains("AuctioneerUnavailable"),
+                "should distinguish invalid selection from unavailable support: {execution}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn execution_selection_remote_retains_strict_fields() {
+        for execution in [None, Some("remote")] {
+            for field in ["auctioneer", "account", "artifact_identity", "unexpected"] {
+                let mut provider = remote_provider();
+                if let Some(execution) = execution {
+                    provider["execution"] = serde_json::json!(execution);
+                }
+                provider[field] = serde_json::json!({});
+                let error = serde_json::from_value::<AuctionConfig>(serde_json::json!({
+                    "providers": {"pbs-main": provider}
+                }))
+                .expect_err("should reject local or unknown fields on remote execution");
+                assert!(
+                    error.to_string().contains(field),
+                    "should name the invalid remote field: {error}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn execution_selection_remote_rejects_duplicate_fields() {
+        // String input is necessary because json! discards duplicate object keys.
+        for duplicate in [
+            r#""notifications":{"suppress_all":false,"suppress_all":true}"#,
+            r#""execution":"remote","execution":"remote""#,
+            r#""execution":"remote","profile":"standard","profile":"prebid-server""#,
+        ] {
+            let input = format!(
+                r#"{{"providers":{{"pbs-main":{{{duplicate},"protocol":"openrtb-2.6","endpoint":"https://prebid.example.com/auction"}}}}}}"#
+            );
+            let error = serde_json::from_str::<AuctionConfig>(&input)
+                .expect_err("should preserve duplicate-field rejection");
+            assert!(
+                error.to_string().contains("duplicate field"),
+                "should reject duplicate fields: {error}"
+            );
+        }
     }
 
     #[test]

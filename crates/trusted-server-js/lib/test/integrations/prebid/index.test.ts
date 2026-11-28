@@ -161,6 +161,7 @@ interface TestBid {
 
 /** Loose ad unit shape used by the requestBids shim tests. */
 interface TestAdUnit {
+  mediaTypes?: { banner: { sizes: number[][]; name?: string } };
   code?: string;
   bids?: TestBid[];
 }
@@ -3868,11 +3869,78 @@ describe('prebid/installRefreshHandler', () => {
     mockPbjs.adUnits = [];
   });
 
+  it.each([false, true])(
+    'preserves authored live refresh merge order and first stored intent: reverse=%s',
+    (reverse) => {
+      const code = 'example-live-merge-order';
+      const first = {
+        bidder: 'trustedServer',
+        params: {
+          storedRequest: null,
+          bidderParams: {
+            exampleServer: { source: 'first-folded' },
+            unowned: { source: 'refuse' },
+          },
+        },
+      };
+      const second = {
+        bidder: 'trustedServer',
+        params: { storedRequest: true, bidderParams: { exampleServer: { source: 'last-folded' } } },
+      };
+      const clients = [
+        { bidder: 'exampleBrowser', params: { placement: 'one' } },
+        { bidder: 'exampleBrowser', params: { placement: 'two' } },
+      ];
+      const bids = [
+        { bidder: 'exampleServer', params: { source: 'first-raw' } },
+        first,
+        clients[0],
+        { bidder: 'exampleServer', params: { source: 'last-raw' } },
+        second,
+        clients[1],
+      ];
+      mockPbjs.adUnits = [
+        {
+          code,
+          mediaTypes: { banner: { name: 'live-zone', sizes: [[300, 250]] } },
+          bids: reverse ? [...bids].reverse() : bids,
+        },
+      ];
+      testWindow.__tsjs_prebid = { serverSideBidders: ['exampleServer'] };
+      const slot = {
+        getSlotElementId: () => code,
+        getTargeting: () => [],
+        getSizes: () => [[300, 250]],
+        clearTargeting: vi.fn(),
+      };
+      const pubads = { refresh: vi.fn(), getSlots: () => [slot] };
+      testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+      installRefreshHandler();
+      pubads.refresh([slot]);
+      const requested = mockRequestBids.mock.calls.slice(-1)[0]![0].adUnits[0];
+      expect(requested.bids).toEqual([
+        {
+          bidder: 'trustedServer',
+          params: {
+            storedRequest: reverse ? true : null,
+            zone: 'live-zone',
+            bidderParams: { exampleServer: { source: reverse ? 'first-raw' : 'last-folded' } },
+          },
+        },
+        ...(reverse ? [...clients].reverse() : clients),
+      ]);
+      expect(requested.bids[1].params).not.toBe((reverse ? clients[1] : clients[0]).params);
+    }
+  );
+
   it('auctions refreshed TS initial slots and clears stale TS targeting before refresh', () => {
     const originalRefresh = vi.fn();
     const slotTargeting = new Map<string, string[]>([
       ['ts_initial', ['1']],
       ['zone', ['homepage']],
+      ['custom_deal', ['deal-1']],
+      ['custom_pb', ['1.234']],
+      ['publisher_key', ['retain']],
     ]);
     const clearTargeting = vi.fn((key: string) => {
       slotTargeting.delete(key);
@@ -3903,6 +3971,16 @@ describe('prebid/installRefreshHandler', () => {
       pubads: () => pubads,
     };
     testWindow.tsjs = {
+      prevSlotTargetingKeys: {
+        'div-ad-homepage-header': [
+          'zone',
+          'section',
+          'custom_deal',
+          'custom_pb',
+          'hb_pb',
+          'ts_initial',
+        ],
+      },
       adSlots: [
         {
           id: 'homepage_header_ad',
@@ -3912,7 +3990,7 @@ describe('prebid/installRefreshHandler', () => {
             [970, 250],
             [728, 90],
           ],
-          targeting: { zone: 'homepage' },
+          targeting: { zone: 'homepage', section: 'front', custom_pb: 'configured-price' },
         },
       ],
     };
@@ -3947,6 +4025,17 @@ describe('prebid/installRefreshHandler', () => {
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
     expect(clearTargeting).not.toHaveBeenCalledWith('ts');
+    expect(clearTargeting).toHaveBeenCalledWith('custom_deal');
+    expect(clearTargeting).toHaveBeenCalledWith('custom_pb');
+    expect(clearTargeting).not.toHaveBeenCalledWith('publisher_key');
+    expect(slotTargeting.has('custom_deal')).toBe(false);
+    expect(slotTargeting.get('custom_pb')).toEqual(['configured-price']);
+    expect(slotTargeting.get('zone')).toEqual(['homepage']);
+    expect(slotTargeting.get('section')).toEqual(['front']);
+    expect(clearTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
+      mockRequestBids.mock.invocationCallOrder[0]
+    );
+    expect(slotTargeting.get('publisher_key')).toEqual(['retain']);
     expect(originalRefresh).not.toHaveBeenCalled();
 
     const bidsBackHandler = mockRequestBids.mock.calls[0][0].bidsBackHandler;
@@ -3962,12 +4051,23 @@ describe('prebid/installRefreshHandler', () => {
 
   it('passes an explicitly excluded path directly to GPT after clearing stale targeting', () => {
     const originalRefresh = vi.fn();
-    const clearTargeting = vi.fn();
+    const values = new Map<string, string[]>([
+      ['zone', ['engine-zone']],
+      ['custom_deal', ['deal-1']],
+      ['publisher_key', ['retain']],
+    ]);
+    const clearTargeting = vi.fn((key: string) => {
+      values.delete(key);
+    });
+    const setTargeting = vi.fn((key: string, value: string) => {
+      values.set(key, [value]);
+    });
     const gptSlot = {
       getSlotElementId: vi.fn(() => 'div-ad-tracking'),
       getAdUnitPath: vi.fn(() => '/123/trackingonly'),
-      getTargeting: vi.fn(() => []),
+      getTargeting: vi.fn((key: string) => values.get(key) ?? []),
       clearTargeting,
+      setTargeting,
     };
     const pubads = {
       refresh: originalRefresh,
@@ -3979,6 +4079,18 @@ describe('prebid/installRefreshHandler', () => {
     };
     testWindow.__tsjs_prebid = {
       excludedGamAdUnitPathSuffixes: ['/trackingonly'],
+    };
+    testWindow.tsjs = {
+      adSlots: [
+        {
+          id: 'tracking_slot',
+          gam_unit_path: '/123/trackingonly',
+          div_id: 'div-ad-tracking',
+          formats: [[300, 250]],
+          targeting: { zone: 'configured-zone', section: 'front', hb_pb: 'stale-price' },
+        },
+      ],
+      prevSlotTargetingKeys: { 'div-ad-tracking': ['zone', 'custom_deal', 'hb_pb'] },
     };
     const options = { changeCorrelator: false };
 
@@ -3992,8 +4104,136 @@ describe('prebid/installRefreshHandler', () => {
     expect(clearTargeting).toHaveBeenCalledWith('hb_adid');
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_host');
     expect(clearTargeting).toHaveBeenCalledWith('hb_cache_path');
+    expect(values.get('zone')).toEqual(['configured-zone']);
+    expect(values.get('section')).toEqual(['front']);
+    expect(values.has('custom_deal')).toBe(false);
+    expect(values.has('hb_pb')).toBe(false);
+    expect(values.get('publisher_key')).toEqual(['retain']);
+    expect(setTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
+      originalRefresh.mock.invocationCallOrder[0]
+    );
     expect(originalRefresh).toHaveBeenCalledWith([gptSlot], options);
   });
+
+  it.each(
+    ['constructor', '__proto__', 'toString'].flatMap((elementId) => [
+      { elementId, tracked: false },
+      { elementId, tracked: true },
+    ])
+  )('keeps refresh isolated for prototype-named slot %j', ({ elementId, tracked }) => {
+    const originalRefresh = vi.fn();
+    const clearTargeting = vi.fn();
+    const slot = {
+      getSlotElementId: () => elementId,
+      getAdUnitPath: () => '/123/trackingonly',
+      getTargeting: () => [],
+      clearTargeting,
+    };
+    const pubads = { refresh: originalRefresh, getSlots: () => [slot] };
+    testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+    testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+    testWindow.tsjs = {
+      prevSlotTargetingKeys: tracked ? Object.fromEntries([[elementId, ['custom_deal']]]) : {},
+    };
+    installRefreshHandler();
+    expect(() => pubads.refresh([slot])).not.toThrow();
+    expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    expect(mockRequestBids).not.toHaveBeenCalled();
+    expect(clearTargeting).toHaveBeenCalledWith('hb_pb');
+    if (tracked) expect(clearTargeting).toHaveBeenCalledWith('custom_deal');
+    else expect(clearTargeting).not.toHaveBeenCalledWith('custom_deal');
+  });
+
+  it.each([undefined, 'header_slot', 'broad_slot'])(
+    'restores only the matching configured context for overlapping div prefixes: %s',
+    (mappedSlot) => {
+      const values = new Map<string, string[]>([
+        ['section', ['old-engine']],
+        ['custom_deal', ['deal-1']],
+        ['publisher_key', ['retain']],
+      ]);
+      const originalRefresh = vi.fn();
+      const slot = {
+        getSlotElementId: () => 'ad-header-123',
+        getAdUnitPath: () => '/123/trackingonly',
+        getTargeting: (key: string) => values.get(key) ?? [],
+        clearTargeting: vi.fn((key: string) => {
+          values.delete(key);
+        }),
+        setTargeting: vi.fn((key: string, value: string) => {
+          values.set(key, [value]);
+        }),
+      };
+      const pubads = { refresh: originalRefresh, getSlots: () => [slot] };
+      testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+      testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+      testWindow.tsjs = {
+        adSlots: [
+          {
+            id: 'broad_slot',
+            gam_unit_path: '/123/broad',
+            div_id: 'ad',
+            formats: [[300, 250]],
+            targeting: { section: 'broad' },
+          },
+          {
+            id: 'header_slot',
+            gam_unit_path: '/123/header',
+            div_id: 'ad-header',
+            formats: [[300, 250]],
+            targeting: { section: 'header' },
+          },
+        ],
+        ...(mappedSlot ? { divToSlotId: { 'ad-header-123': mappedSlot } } : {}),
+        prevSlotTargetingKeys: { 'ad-header-123': ['section', 'custom_deal'] },
+      };
+      installRefreshHandler();
+      pubads.refresh([slot]);
+      expect(values.get('section')).toEqual([mappedSlot === 'broad_slot' ? 'broad' : 'header']);
+      expect(values.has('custom_deal')).toBe(false);
+      expect(values.get('publisher_key')).toEqual(['retain']);
+      expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    }
+  );
+
+  it.each(['ad-header', 'ad-header-container', 'ad-header-123'])(
+    'refuses ambiguous configured context during refresh: %s',
+    (elementId) => {
+      const originalRefresh = vi.fn();
+      const slot = {
+        getSlotElementId: () => elementId,
+        getAdUnitPath: () => '/123/trackingonly',
+        getTargeting: () => [],
+        clearTargeting: vi.fn(),
+        setTargeting: vi.fn(),
+      };
+      const pubads = { refresh: originalRefresh, getSlots: () => [slot] };
+      testWindow.googletag = { cmd: { push: (fn: () => void) => fn() }, pubads: () => pubads };
+      testWindow.__tsjs_prebid = { excludedGamAdUnitPathSuffixes: ['/trackingonly'] };
+      testWindow.tsjs = {
+        adSlots: [
+          {
+            id: 'one',
+            gam_unit_path: '/123/one',
+            div_id: 'ad-header',
+            formats: [[300, 250]],
+            targeting: { section: 'one' },
+          },
+          {
+            id: 'two',
+            gam_unit_path: '/123/two',
+            div_id: 'ad-header',
+            formats: [[300, 250]],
+            targeting: { section: 'two' },
+          },
+        ],
+      };
+      installRefreshHandler();
+      pubads.refresh([slot]);
+      expect(slot.setTargeting).not.toHaveBeenCalled();
+      expect(originalRefresh).toHaveBeenCalledWith([slot], undefined);
+    }
+  );
 
   it('passes an all-excluded global refresh directly to GPT', () => {
     const originalRefresh = vi.fn();

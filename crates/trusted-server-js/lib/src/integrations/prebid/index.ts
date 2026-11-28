@@ -85,10 +85,6 @@ function parseManifestList(value: unknown): string[] | undefined {
   return [...value];
 }
 
-function isManifestContainer(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === 'object' && !Array.isArray(value);
-}
-
 function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   if (typeof window === 'undefined') {
     return undefined;
@@ -97,12 +93,12 @@ function getExternalBundleManifest(): ExternalPrebidBundleManifest | undefined {
   // Page code can replace this global. Validate each nested list instead of
   // trusting the generated TypeScript shape.
   const raw = (window as { __tsjs_prebid_bundle?: unknown }).__tsjs_prebid_bundle;
-  if (!isManifestContainer(raw) || raw.schemaVersion !== 1) {
+  if (!isRecord(raw) || raw.schemaVersion !== 1) {
     return undefined;
   }
 
-  const modules = isManifestContainer(raw.modules) ? raw.modules : {};
-  const runtimeCodes = isManifestContainer(raw.runtimeCodes) ? raw.runtimeCodes : {};
+  const modules = isRecord(raw.modules) ? raw.modules : {};
+  const runtimeCodes = isRecord(raw.runtimeCodes) ? raw.runtimeCodes : {};
   return {
     schemaVersion: 1,
     modules: {
@@ -253,6 +249,10 @@ export function collectBidders(adUnits: Array<{ bids?: Array<{ bidder?: string }
   return [...bidders];
 }
 
+function hasOwn(value: object, key: PropertyKey): boolean {
+  return Object.prototype.hasOwnProperty.call(value, key);
+}
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object' && !Array.isArray(value);
 }
@@ -279,11 +279,7 @@ function configuredUserIdEntries(config: unknown): PrebidUserIdConfigEntry[] {
 function hasUserIdsPath(config: unknown): config is Record<string, unknown> & {
   userSync: Record<string, unknown> & { userIds: unknown };
 } {
-  return (
-    isRecord(config) &&
-    isRecord(config.userSync) &&
-    Object.prototype.hasOwnProperty.call(config.userSync, 'userIds')
-  );
+  return isRecord(config) && isRecord(config.userSync) && hasOwn(config.userSync, 'userIds');
 }
 
 function configuredUserIdNamesFromConfig(config: unknown): string[] {
@@ -470,7 +466,8 @@ let auctionEndpoint = '/auction';
 export function auctionBidsToPrebidBids(
   auctionBids: AuctionBid[],
   bidRequests: Array<{ adUnitCode?: string; code?: string; bidId?: string }>,
-  apsRendererSupported: boolean
+  apsRendererSupported: boolean,
+  generation?: number
 ) {
   // Build a lookup from impid (adUnitCode) → original bidRequest
   const requestsByCode = new Map<string, (typeof bidRequests)[number]>();
@@ -497,6 +494,11 @@ export function auctionBidsToPrebidBids(
       return [];
     }
 
+    const selected =
+      bid.targeting === undefined
+        ? undefined
+        : window.tsjs?.prebidTargeting?.admit(pbjs, bid.impid, bid.targeting, generation);
+    if (bid.targeting !== undefined && !selected) return [];
     const origReq = requestsByCode.get(bid.impid);
     return [
       {
@@ -513,6 +515,7 @@ export function auctionBidsToPrebidBids(
         bidderCode: bid.seat,
         meta: {
           advertiserDomains: bid.adomain,
+          ...(selected ? { tsjsSelectedTargeting: selected } : {}),
           // Second descriptor carrier. See APS_RENDERER_FIELD for the rationale.
           ...(renderer ? { [APS_RENDERER_FIELD]: renderer } : {}),
         },
@@ -569,9 +572,7 @@ function isLegacyTcfConsentManagement(consentManagement: unknown): boolean {
  */
 function hasNamespacedConsentManagement(consentManagement: Record<string, unknown>): boolean {
   return CONSENT_MANAGEMENT_NAMESPACES.some(
-    (namespace) =>
-      Object.prototype.hasOwnProperty.call(consentManagement, namespace) &&
-      Boolean(consentManagement[namespace])
+    (namespace) => hasOwn(consentManagement, namespace) && Boolean(consentManagement[namespace])
   );
 }
 
@@ -871,10 +872,7 @@ function activateManagedUserIdTcfConsent(
 }
 
 function publisherClaimsGdprOwnership(publisherConfig: PbjsConfig): boolean {
-  if (
-    !isRecord(publisherConfig) ||
-    !Object.prototype.hasOwnProperty.call(publisherConfig, 'consentManagement')
-  ) {
+  if (!isRecord(publisherConfig) || !hasOwn(publisherConfig, 'consentManagement')) {
     return false;
   }
 
@@ -910,10 +908,7 @@ function removeAutomaticGdprNamespace(
     return;
   }
 
-  if (
-    !isRecord(effectiveConsentManagement) ||
-    !Object.prototype.hasOwnProperty.call(effectiveConsentManagement, 'gdpr')
-  ) {
+  if (!isRecord(effectiveConsentManagement) || !hasOwn(effectiveConsentManagement, 'gdpr')) {
     return;
   }
 
@@ -1014,6 +1009,7 @@ type TrustedServerRequest = {
   bidRequests: TrustedServerBidRequest[];
   tsjsBidRequests: TrustedServerBidRequest[];
   tracePending?: TracePendingHandle;
+  generation?: number;
 };
 
 type PrebidUserIdEid = {
@@ -1050,7 +1046,7 @@ function dispatchPrebidRefresh<T>(
   try {
     tsjs = window.tsjs;
     if (tsjs) {
-      hadOwnContext = Object.prototype.hasOwnProperty.call(tsjs, 'prebidRefreshDispatchInProgress');
+      hadOwnContext = hasOwn(tsjs, 'prebidRefreshDispatchInProgress');
       previousContext = tsjs.prebidRefreshDispatchInProgress;
       shouldRestoreContext = true;
       tsjs.prebidRefreshDispatchInProgress = true;
@@ -1100,7 +1096,7 @@ function sanitizeAuctionUid(uid: {
     sanitizedUid.atype = uid.atype;
   }
 
-  if (uid.ext && typeof uid.ext === 'object' && !Array.isArray(uid.ext)) {
+  if (isRecord(uid.ext)) {
     sanitizedUid.ext = uid.ext as Record<string, unknown>;
   }
 
@@ -1170,14 +1166,23 @@ function findInjectedSlotForRefresh(slot: RefreshGptSlot): AuctionSlot | undefin
     return undefined;
   }
 
-  // Prefer an exact (or container) match across all slots before the prefix
-  // fallback, so prefix-overlapping div_ids (e.g. "ad" and "ad-header") resolve
-  // to the correct slot instead of the first slot whose div_id is a prefix.
-  return (
-    slots.find(
-      (adSlot) => elementId === adSlot.div_id || elementId === `${adSlot.div_id}-container`
-    ) ?? slots.find((adSlot) => adSlot.div_id.length > 0 && elementId.startsWith(adSlot.div_id))
+  const mapping = window.tsjs?.divToSlotId;
+  const mappedId = mapping && hasOwn(mapping, elementId) ? mapping[elementId] : undefined;
+  const mappedSlot = mappedId ? slots.find((adSlot) => adSlot.id === mappedId) : undefined;
+  if (mappedSlot) return mappedSlot;
+
+  const exact = slots.filter(
+    (adSlot) => elementId === adSlot.div_id || elementId === `${adSlot.div_id}-container`
   );
+  if (exact.length > 0) return exact.length === 1 ? exact[0] : undefined;
+
+  // An overlapping prefix must not move another slot's configured targeting here.
+  const matches = slots.filter(
+    (adSlot) => adSlot.div_id.length > 0 && elementId.startsWith(adSlot.div_id)
+  );
+  const longest = matches.reduce((length, adSlot) => Math.max(length, adSlot.div_id.length), 0);
+  const mostSpecific = matches.filter((adSlot) => adSlot.div_id.length === longest);
+  return mostSpecific.length === 1 ? mostSpecific[0] : undefined;
 }
 
 function firstTargetingValue(values: string[] | undefined): string | undefined {
@@ -1287,7 +1292,7 @@ function foldedBidderParams(
 /** Preserve authored presence and values, including invalid values for server validation. */
 function storedRequestParams(bid: TrustedServerBid | undefined): { storedRequest?: unknown } {
   if (!bid) return { storedRequest: false };
-  return Object.prototype.hasOwnProperty.call(bid.params ?? {}, STORED_REQUEST_KEY)
+  return hasOwn(bid.params ?? {}, STORED_REQUEST_KEY)
     ? { storedRequest: copyParamValue(bid.params?.[STORED_REQUEST_KEY]) }
     : {};
 }
@@ -1298,7 +1303,15 @@ function capturePublisherAdUnitSnapshot(
   serverSideBidders: Set<string>
 ): PublisherAdUnitSnapshot | undefined {
   if (typeof unit.code !== 'string' || unit.code.length === 0) return undefined;
+  return publisherDemand(unit, serverSideBidders, 'snapshot');
+}
 
+/** Partition publisher demand using its original snapshot or live-refresh precedence. */
+function publisherDemand(
+  unit: TrustedServerAdUnit,
+  serverSideBidders: Set<string>,
+  source: 'snapshot' | 'refresh'
+): PublisherAdUnitSnapshot {
   const rawBidderParams = Object.create(null) as Record<string, Record<string, unknown>>;
   const clientSideBids: ClientSideBidSnapshot[] = [];
   let existingTsBid: TrustedServerBid | undefined;
@@ -1308,6 +1321,9 @@ function capturePublisherAdUnitSnapshot(
     if (!bid?.bidder) continue;
     if (bid.bidder === ADAPTER_CODE) {
       existingTsBid ??= bid;
+      if (source === 'refresh') {
+        Object.assign(rawBidderParams, foldedBidderParams(bid, serverSideBidders));
+      }
       continue;
     }
     if (!serverSideBidders.has(bid.bidder)) {
@@ -1331,108 +1347,20 @@ function capturePublisherAdUnitSnapshot(
   };
 }
 
-/**
- * Collect browser-owned bidder entries for a refreshing slot.
- *
- * Synthetic refresh ad units carry only the `trustedServer` bid. The
- * `requestBids` shim preserves every bidder not owned by the server plan when
- * its bid entry is already present on the ad unit, so re-attach those bidders
- * here. A live exact `pbjs.adUnits` match is authoritative; request-scoped
- * snapshots are used only when no live unit exists.
- */
-function clientSideBidsForRefresh(
-  candidateCodes: Array<string | undefined>
-): Array<{ bidder: string; params: Record<string, unknown> }> {
-  const serverSideBidders = new Set(injectedServerSideBidderCodes());
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    if (!Array.isArray(match.bids)) return [];
-
-    const bids: Array<{ bidder: string; params: Record<string, unknown> }> = [];
-    for (const bid of match.bids) {
-      if (bid?.bidder && bid.bidder !== ADAPTER_CODE && !serverSideBidders.has(bid.bidder)) {
-        bids.push({ bidder: bid.bidder, params: copyParams(bid.params) });
+/** Resolve and copy refresh demand once, preserving live-unit authority and bid order. */
+function refreshDemandFor(candidateCodes: Array<string | undefined>): PublisherAdUnitSnapshot {
+  const unit = findRefreshAdUnit(candidateCodes);
+  if (!unit) {
+    return copyParamValue(
+      findRefreshSnapshot(candidateCodes) ?? {
+        storedRequest: false,
+        bidderParams: {},
+        clientSideBids: [],
       }
-    }
-    return bids;
+    ) as PublisherAdUnitSnapshot;
   }
 
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  return (
-    snapshot?.clientSideBids.map((bid) => ({
-      bidder: bid.bidder,
-      params: copyParams(bid.params),
-    })) ?? []
-  );
-}
-
-/**
- * Recover the publisher's inline server-side (PBS) bidder params for a slot.
- *
- * The synthetic refresh ad unit carries only the `trustedServer` bid, so the
- * `requestBids` shim has no original server-side bidder entries to collect into
- * `bidderParams` — without this, refresh/scroll `/auction` requests send `{}`
- * and lose demand the publisher configured only on the initial ad unit. A live
- * exact `pbjs.adUnits` match is authoritative and covers both raw bidder entries
- * and params already folded into a `trustedServer` bid. A request-scoped
- * snapshot is used only when no live unit exists.
- */
-function serverSideBidderParamsForRefresh(
-  candidateCodes: Array<string | undefined>
-): Record<string, Record<string, unknown>> {
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    if (!Array.isArray(match.bids)) return {};
-
-    const serverSideBidders = new Set(injectedServerSideBidderCodes());
-    const params = Object.create(null) as Record<string, Record<string, unknown>>;
-
-    for (const bid of match.bids) {
-      if (!bid?.bidder) continue;
-      if (bid.bidder === ADAPTER_CODE) {
-        Object.assign(params, foldedBidderParams(bid, serverSideBidders));
-        continue;
-      }
-      if (!serverSideBidders.has(bid.bidder)) continue;
-      params[bid.bidder] = copyParams(bid.params);
-    }
-
-    return params;
-  }
-
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  return snapshot
-    ? Object.fromEntries(
-        Object.entries(snapshot.bidderParams).map(([bidder, params]) => [
-          bidder,
-          copyParams(params),
-        ])
-      )
-    : {};
-}
-
-/** Use the same live-unit authority and snapshot fallback as refresh bidder params. */
-function storedRequestParamsForRefresh(candidateCodes: Array<string | undefined>): {
-  storedRequest?: unknown;
-} {
-  const match = findRefreshAdUnit(candidateCodes);
-  if (match) {
-    const bid = Array.isArray(match.bids)
-      ? match.bids.find((bid) => bid?.bidder === ADAPTER_CODE)
-      : undefined;
-    return storedRequestParams(bid);
-  }
-  const snapshot = findRefreshSnapshot(candidateCodes);
-  if (!snapshot) return { storedRequest: false };
-  return Object.prototype.hasOwnProperty.call(snapshot, STORED_REQUEST_KEY)
-    ? { storedRequest: copyParamValue(snapshot[STORED_REQUEST_KEY]) }
-    : {};
-}
-
-/** Return a live publisher zone, falling back to a request-scoped snapshot. */
-function publisherZoneForRefresh(candidateCodes: Array<string | undefined>): string | undefined {
-  const match = findRefreshAdUnit(candidateCodes);
-  return match ? match.mediaTypes?.banner?.name : findRefreshSnapshot(candidateCodes)?.zone;
+  return publisherDemand(unit, new Set(injectedServerSideBidderCodes()), 'refresh');
 }
 
 function isUsableRefreshAuctionExclusionSuffix(suffix: unknown): suffix is string {
@@ -1463,10 +1391,24 @@ function isExcludedFromRefreshAuction(
 }
 
 function clearRefreshTargeting(slot: RefreshGptSlot): void {
+  window.tsjs?.prebidTargeting?.clear([slot]);
   if (typeof slot.clearTargeting !== 'function') return;
 
-  for (const key of TS_REFRESH_TARGETING_KEYS) {
+  const elementId = refreshSlotElementId(slot);
+  const recorded = window.tsjs?.prevSlotTargetingKeys;
+  const entry =
+    elementId && recorded && hasOwn(recorded, elementId) ? recorded[elementId] : undefined;
+  const previousKeys = Array.isArray(entry) ? entry : [];
+  for (const key of new Set([...TS_REFRESH_TARGETING_KEYS, ...previousKeys])) {
     slot.clearTargeting(key);
+  }
+  // Restore current operator context after clearing the previous winner's keys.
+  if (typeof slot.setTargeting === 'function') {
+    for (const [key, value] of Object.entries(findInjectedSlotForRefresh(slot)?.targeting ?? {})) {
+      if (!TS_REFRESH_TARGETING_KEYS.some((fixedKey) => fixedKey === key)) {
+        slot.setTargeting(key, value);
+      }
+    }
   }
 }
 
@@ -1712,8 +1654,7 @@ function publisherResponseAdIds(
   bidResponses: unknown
 ): Map<string, string[]> {
   const adIds = new Map<string, string[]>();
-  if (!bidResponses || typeof bidResponses !== 'object' || Array.isArray(bidResponses))
-    return adIds;
+  if (!isRecord(bidResponses)) return adIds;
 
   for (const [responseCode, responseGroup] of Object.entries(bidResponses)) {
     if (!responseGroup || typeof responseGroup !== 'object') continue;
@@ -2455,6 +2396,7 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
         // map bids without relying on shared mutable adapter state.
         bidRequests: requestScopedBidRequests,
         tsjsBidRequests: requestScopedBidRequests,
+        generation: window.tsjs?.navGeneration ?? 0,
         ...(traceHandle ? { tracePending: traceHandle } : {}),
       };
     },
@@ -2473,7 +2415,12 @@ export function installPrebidNpm(config?: Partial<PrebidNpmConfig>): typeof pbjs
       log.debug('[tsjs-prebid] interpretResponse', { hasSeatbid: !!body?.seatbid });
       const auctionBids = parseAuctionResponse(body);
       const bidRequests = request?.tsjsBidRequests ?? request?.bidRequests ?? [];
-      return auctionBidsToPrebidBids(auctionBids, bidRequests, apsRendererSupported);
+      return auctionBidsToPrebidBids(
+        auctionBids,
+        bidRequests,
+        apsRendererSupported,
+        request?.generation
+      );
     },
   });
 
@@ -2823,10 +2770,16 @@ export function installRefreshHandler(timeoutMs = 1500): void {
         // element id used as the synthetic refresh code can differ from the
         // inner `div_id` the publisher keyed their ad unit by. Recover from both.
         const candidateCodes = [code, injectedSlot?.div_id];
+        const {
+          zone: publisherZone,
+          bidderParams,
+          clientSideBids,
+          ...storedRequest
+        } = refreshDemandFor(candidateCodes);
         const zone =
           injectedSlot?.targeting?.[ZONE_KEY] ??
           firstTargetingValue(slot.getTargeting?.(ZONE_KEY)) ??
-          publisherZoneForRefresh(candidateCodes);
+          publisherZone;
         const banner: TrustedServerBanner = {
           sizes:
             bannerSizesFromInjectedSlot(injectedSlot) ??
@@ -2835,22 +2788,18 @@ export function installRefreshHandler(timeoutMs = 1500): void {
           ...(zone ? { name: zone } : {}),
         };
         const tsParams: Record<string, unknown> = {
-          ...storedRequestParamsForRefresh(candidateCodes),
+          ...storedRequest,
           ...(zone ? { [ZONE_KEY]: zone } : {}),
         };
         // Carry the publisher's inline server-side (PBS) bidder params captured
         // on the initial ad unit so refresh/scroll auctions don't drop them.
-        const serverSideParams = serverSideBidderParamsForRefresh(candidateCodes);
-        if (Object.keys(serverSideParams).length > 0) {
-          tsParams[BIDDER_PARAMS_KEY] = serverSideParams;
+        if (Object.keys(bidderParams).length > 0) {
+          tsParams[BIDDER_PARAMS_KEY] = bidderParams;
         }
         return {
           code,
           mediaTypes: { banner },
-          bids: [
-            { bidder: ADAPTER_CODE, params: tsParams },
-            ...clientSideBidsForRefresh(candidateCodes),
-          ],
+          bids: [{ bidder: ADAPTER_CODE, params: tsParams }, ...clientSideBids],
         };
       });
 

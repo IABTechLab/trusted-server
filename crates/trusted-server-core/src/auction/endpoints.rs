@@ -21,7 +21,7 @@ use crate::ec::prebid_eids::parse_prebid_eids_cookie;
 use crate::ec::registry::PartnerRegistry;
 use crate::error::TrustedServerError;
 use crate::http_util::read_request_body;
-use crate::openrtb::{Eid, Uid};
+use crate::openrtb::{Eid, Uid, uid_extension};
 use crate::platform::RuntimeServices;
 use crate::settings::Settings;
 use crate::trace::{
@@ -602,7 +602,11 @@ fn parse_client_auction_eids(raw: Option<&JsonValue>) -> Option<Vec<Eid>> {
             continue;
         }
 
-        eids.push(Eid { source, uids });
+        eids.push(Eid {
+            source: Some(source),
+            uids: Some(uids),
+            ..Default::default()
+        });
     }
 
     if eids.is_empty() { None } else { Some(eids) }
@@ -625,12 +629,17 @@ fn parse_client_auction_uid(raw: &JsonValue) -> Option<Uid> {
         .and_then(JsonValue::as_u64)
         .and_then(|atype| i32::try_from(atype).ok());
 
-    let ext = match uid.get("ext") {
-        Some(JsonValue::Object(_)) => uid.get("ext").cloned(),
-        _ => None,
-    };
+    let ext = uid
+        .get("ext")
+        .filter(|value| value.is_object())
+        .and_then(uid_extension);
 
-    Some(Uid { id, atype, ext })
+    Some(Uid {
+        id,
+        atype,
+        ext,
+        ..Default::default()
+    })
 }
 
 pub(crate) fn merge_auction_eids(
@@ -644,31 +653,34 @@ pub(crate) fn merge_auction_eids(
         .flatten()
         .chain(client_eids.into_iter().flatten())
     {
-        if eid.source.is_empty() {
+        let Some(source) = eid.source.filter(|source| !source.is_empty()) else {
             continue;
-        }
+        };
 
         let source_index = match merged
             .iter()
-            .position(|existing: &Eid| existing.source == eid.source)
+            .position(|existing: &Eid| existing.source.as_deref() == Some(source.as_str()))
         {
             Some(index) => index,
             None => {
                 merged.push(Eid {
-                    source: eid.source.clone(),
-                    uids: Vec::new(),
+                    source: Some(source),
+                    uids: Some(Vec::new()),
+                    ..Default::default()
                 });
                 merged.len() - 1
             }
         };
 
-        for uid in eid.uids {
+        let merged_uids = merged[source_index].uids.get_or_insert_with(Vec::new);
+        for mut uid in eid.uids.into_iter().flatten() {
             if uid.id.trim().is_empty() || uid.id.len() > MAX_UID_LENGTH {
                 continue;
             }
 
-            if let Some(existing_uid) = merged[source_index]
-                .uids
+            // Shared raw fields do not grant additional forwarding permission.
+            uid.other.clear();
+            if let Some(existing_uid) = merged_uids
                 .iter_mut()
                 .find(|existing| existing.id == uid.id)
             {
@@ -679,12 +691,12 @@ pub(crate) fn merge_auction_eids(
                     existing_uid.ext = uid.ext;
                 }
             } else {
-                merged[source_index].uids.push(uid);
+                merged_uids.push(uid);
             }
         }
     }
 
-    merged.retain(|eid| !eid.uids.is_empty());
+    merged.retain(|eid| eid.uids.as_ref().is_some_and(|uids| !uids.is_empty()));
 
     if merged.is_empty() {
         None
@@ -724,6 +736,83 @@ mod tests {
     use edgezero_core::{FastlyFailureCause, ProviderFailureDetail, ProviderFailurePhase};
     use serde_json::json;
     use std::sync::{Arc, Mutex};
+
+    #[test]
+    fn openrtb_shared_types_body_eids_keep_only_permitted_fields() {
+        let raw = json!([
+            null,
+            {"source": " ", "uids": [{"id": "invalid-source"}]},
+            {"uids": [{"id": "missing-source"}]},
+            {"source": "identity.example", "uids": null},
+            {
+                "source": " identity.example ",
+                "unknown": "do-not-forward",
+                "uids": [
+                    null,
+                    {"id": ""},
+                    {
+                        "id": " fictional-uid ",
+                        "atype": 571187,
+                        "ext": {"z": 2, "a": 1},
+                        "unknown": "do-not-forward"
+                    }
+                ]
+            }
+        ]);
+
+        let eids = parse_client_auction_eids(Some(&raw)).expect("should retain valid identity");
+
+        assert_eq!(
+            serde_json::to_value(eids).expect("should serialize normalized identity"),
+            json!([{
+                "source": " identity.example ",
+                "uids": [{
+                    "id": " fictional-uid ",
+                    "atype": 571187,
+                    "ext": {"a": 1, "z": 2}
+                }]
+            }]),
+            "should preserve permitted values without trimming or forwarding unknown fields"
+        );
+    }
+
+    #[test]
+    fn openrtb_shared_types_merge_restricts_shared_raw_fields() {
+        let client = serde_json::from_value::<Vec<Eid>>(json!([
+            {"source": null, "uids": [{"id": "missing-source"}]},
+            {"source": "empty-identity.example", "uids": null},
+            {
+                "source": "identity.example",
+                "unknown": "do-not-forward",
+                "uids": [
+                    {"id": "same", "atype": 2, "ext": {"segment": "fictional"}},
+                    {"id": "client-only", "unknown": "do-not-forward"}
+                ]
+            }
+        ]))
+        .expect("should construct shared raw client identities");
+        let server = serde_json::from_value::<Vec<Eid>>(json!([{
+            "source": "identity.example",
+            "unknown": "do-not-forward",
+            "uids": [{"id": "same", "atype": 1, "unknown": "do-not-forward"}]
+        }]))
+        .expect("should construct shared raw server identities");
+
+        let merged = merge_auction_eids(Some(client), Some(server))
+            .expect("should retain valid server and client identities");
+
+        assert_eq!(
+            serde_json::to_value(merged).expect("should serialize merged identities"),
+            json!([{
+                "source": "identity.example",
+                "uids": [
+                    {"id": "same", "atype": 1, "ext": {"segment": "fictional"}},
+                    {"id": "client-only"}
+                ]
+            }]),
+            "should keep server precedence and permitted extensions without forwarding new raw fields"
+        );
+    }
 
     #[derive(Default)]
     struct RecordingTelemetrySink {
@@ -954,7 +1043,10 @@ mod tests {
         assert_eq!(
             ec_context.client_eids().map(|eids| eids
                 .iter()
-                .map(|eid| eid.source.as_str())
+                .map(|eid| eid
+                    .source
+                    .as_deref()
+                    .expect("should contain normalized source"))
                 .collect::<Vec<_>>()),
             Some(vec!["id5-sync.com"]),
             "the endpoint must hand its parsed body EIDs to the request context"
@@ -1798,15 +1890,39 @@ mod tests {
             .expect("should fall back to structured ts-eids cookie");
 
         assert_eq!(resolved.len(), 1, "should preserve cookie source entry");
-        assert_eq!(resolved[0].source, "sharedid.org");
         assert_eq!(
-            resolved[0].uids.len(),
+            resolved[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "sharedid.org"
+        );
+        assert_eq!(
+            resolved[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
             2,
             "should preserve multiple cookie UIDs"
         );
-        assert_eq!(resolved[0].uids[0].id, "shared_cookie");
         assert_eq!(
-            resolved[0].uids[1].ext,
+            resolved[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "shared_cookie"
+        );
+        assert_eq!(
+            resolved[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[1]
+                .ext
+                .as_ref()
+                .map(|extension| serde_json::to_value(extension)
+                    .expect("should serialize UID extension")),
             Some(json!({ "provider": "example" })),
             "should preserve UID ext from cookie fallback"
         );
@@ -1833,8 +1949,21 @@ mod tests {
             .expect("should prefer request body EIDs");
 
         assert_eq!(resolved.len(), 1, "should use request body when present");
-        assert_eq!(resolved[0].source, "id5-sync.com");
-        assert_eq!(resolved[0].uids[0].id, "body_uid");
+        assert_eq!(
+            resolved[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "id5-sync.com"
+        );
+        assert_eq!(
+            resolved[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "body_uid"
+        );
     }
 
     #[test]
@@ -1857,10 +1986,38 @@ mod tests {
         let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
 
         assert_eq!(parsed.len(), 2, "should keep only valid EID entries");
-        assert_eq!(parsed[0].source, "id5-sync.com");
-        assert_eq!(parsed[0].uids.len(), 1, "should keep valid UID");
-        assert_eq!(parsed[1].source, "sharedid.org");
-        assert_eq!(parsed[1].uids.len(), 1, "should drop empty UID values");
+        assert_eq!(
+            parsed[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "id5-sync.com"
+        );
+        assert_eq!(
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            1,
+            "should keep valid UID"
+        );
+        assert_eq!(
+            parsed[1]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "sharedid.org"
+        );
+        assert_eq!(
+            parsed[1]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            1,
+            "should drop empty UID values"
+        );
     }
 
     #[test]
@@ -1886,9 +2043,12 @@ mod tests {
             "should cap client EID sources"
         );
         assert!(
-            parsed
-                .iter()
-                .all(|eid| eid.uids.len() == MAX_CLIENT_UIDS_PER_SOURCE),
+            parsed.iter().all(|eid| eid
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len()
+                == MAX_CLIENT_UIDS_PER_SOURCE),
             "should cap UIDs per source"
         );
     }
@@ -1909,8 +2069,24 @@ mod tests {
         let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid UID");
 
         assert_eq!(parsed.len(), 1, "should retain source with valid UID");
-        assert_eq!(parsed[0].uids.len(), 1, "should drop invalid UIDs");
-        assert_eq!(parsed[0].uids[0].id, "valid", "should keep valid UID");
+        assert_eq!(
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            1,
+            "should drop invalid UIDs"
+        );
+        assert_eq!(
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "valid",
+            "should keep valid UID"
+        );
     }
 
     #[test]
@@ -1925,7 +2101,11 @@ mod tests {
         let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse PAIR EID");
 
         assert_eq!(
-            parsed[0].uids[0].atype,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(571187),
             "should preserve PAIR's vendor-specific atype"
         );
@@ -1958,28 +2138,64 @@ mod tests {
         let parsed = parse_client_auction_eids(Some(&raw)).expect("should parse valid EIDs");
 
         assert_eq!(parsed.len(), 1, "should keep valid source");
-        assert_eq!(parsed[0].uids.len(), 3, "should keep valid UIDs");
         assert_eq!(
-            parsed[0].uids[0].atype,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            3,
+            "should keep valid UIDs"
+        );
+        assert_eq!(
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(1),
             "should preserve valid atype"
         );
         assert_eq!(
-            parsed[0].uids[0].ext,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .ext
+                .as_ref()
+                .map(|extension| serde_json::to_value(extension)
+                    .expect("should serialize UID extension")),
             Some(json!({ "provider": "liveintent.com", "rtiPartner": "TDID" })),
             "should preserve uid ext"
         );
         assert_eq!(
-            parsed[0].uids[1].atype, None,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[1]
+                .atype,
+            None,
             "should drop out-of-range atype without dropping uid"
         );
         assert_eq!(
-            parsed[0].uids[1].ext,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[1]
+                .ext
+                .as_ref()
+                .map(|extension| serde_json::to_value(extension)
+                    .expect("should serialize UID extension")),
             Some(json!({ "keep": true })),
             "should preserve ext when atype is invalid"
         );
         assert_eq!(
-            parsed[0].uids[2].atype, None,
+            parsed[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[2]
+                .atype,
+            None,
             "should drop non-integer atype without dropping uid"
         );
     }
@@ -1987,98 +2203,184 @@ mod tests {
     #[test]
     fn merge_auction_eids_deduplicates_client_and_resolved_ids() {
         let client_eids = Some(vec![Eid {
-            source: "id5-sync.com".to_string(),
-            uids: vec![Uid {
+            source: Some("id5-sync.com".to_string()),
+            uids: Some(vec![Uid {
                 id: "ID5_abc".to_string(),
                 atype: Some(1),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
         let resolved_eids = Some(vec![
             Eid {
-                source: "id5-sync.com".to_string(),
-                uids: vec![Uid {
+                source: Some("id5-sync.com".to_string()),
+                uids: Some(vec![Uid {
                     id: "ID5_abc".to_string(),
                     atype: Some(1),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             Eid {
-                source: "liveramp.com".to_string(),
-                uids: vec![Uid {
+                source: Some("liveramp.com".to_string()),
+                uids: Some(vec![Uid {
                     id: "LR_xyz".to_string(),
                     atype: Some(3),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
         ]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
         assert_eq!(merged.len(), 2, "should retain distinct EID sources");
-        assert_eq!(merged[0].source, "id5-sync.com");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate matching UIDs");
-        assert_eq!(merged[1].source, "liveramp.com");
-        assert_eq!(merged[1].uids[0].id, "LR_xyz");
+        assert_eq!(
+            merged[0]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "id5-sync.com"
+        );
+        assert_eq!(
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            1,
+            "should deduplicate matching UIDs"
+        );
+        assert_eq!(
+            merged[1]
+                .source
+                .as_deref()
+                .expect("should contain normalized source"),
+            "liveramp.com"
+        );
+        assert_eq!(
+            merged[1]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "LR_xyz"
+        );
     }
 
     #[test]
     fn merge_auction_eids_preserves_multiple_uids_per_source() {
         let client_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+            source: Some("sharedid.org".to_string()),
+            uids: Some(vec![Uid {
                 id: "shared_client".to_string(),
                 atype: None,
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
         let resolved_eids = Some(vec![Eid {
-            source: "sharedid.org".to_string(),
-            uids: vec![Uid {
+            source: Some("sharedid.org".to_string()),
+            uids: Some(vec![Uid {
                 id: "shared_server".to_string(),
                 atype: Some(3),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
         assert_eq!(merged.len(), 1, "should merge same-source entries");
-        assert_eq!(merged[0].uids.len(), 2, "should preserve distinct UIDs");
-        assert_eq!(merged[0].uids[0].id, "shared_server");
-        assert_eq!(merged[0].uids[1].id, "shared_client");
+        assert_eq!(
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            2,
+            "should preserve distinct UIDs"
+        );
+        assert_eq!(
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .id,
+            "shared_server"
+        );
+        assert_eq!(
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[1]
+                .id,
+            "shared_client"
+        );
     }
 
     #[test]
     fn merge_auction_eids_prefers_server_resolved_metadata_on_conflict() {
         let client_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+            source: Some("adserver.org".to_string()),
+            uids: Some(vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(1),
-                ext: Some(json!({ "provider": "client" })),
-            }],
+                ext: (Some(json!({ "provider": "client" })))
+                    .as_ref()
+                    .and_then(crate::openrtb::uid_extension),
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
         let resolved_eids = Some(vec![Eid {
-            source: "adserver.org".to_string(),
-            uids: vec![Uid {
+            source: Some("adserver.org".to_string()),
+            uids: Some(vec![Uid {
                 id: "shared_uid".to_string(),
                 atype: Some(3),
-                ext: Some(json!({ "provider": "server" })),
-            }],
+                ext: (Some(json!({ "provider": "server" })))
+                    .as_ref()
+                    .and_then(crate::openrtb::uid_extension),
+                ..Default::default()
+            }]),
+            ..Default::default()
         }]);
 
         let merged = merge_auction_eids(client_eids, resolved_eids).expect("should merge EIDs");
 
         assert_eq!(merged.len(), 1, "should merge duplicate source");
-        assert_eq!(merged[0].uids.len(), 1, "should deduplicate duplicate uid");
         assert_eq!(
-            merged[0].uids[0].atype,
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")
+                .len(),
+            1,
+            "should deduplicate duplicate uid"
+        );
+        assert_eq!(
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .atype,
             Some(3),
             "should prefer resolved atype"
         );
         assert_eq!(
-            merged[0].uids[0].ext,
+            merged[0]
+                .uids
+                .as_ref()
+                .expect("should contain normalized UIDs")[0]
+                .ext
+                .as_ref()
+                .map(|extension| serde_json::to_value(extension)
+                    .expect("should serialize UID extension")),
             Some(json!({ "provider": "server" })),
             "should prefer resolved ext"
         );

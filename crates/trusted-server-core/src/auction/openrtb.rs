@@ -19,8 +19,9 @@ use super::routing::{
 use super::types::{AdFormat, AdSlot, AuctionResponse, Bid};
 use crate::error::TrustedServerError;
 use crate::openrtb::{
-    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, OpenRtbRequest, Publisher, Regs,
-    RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt, to_openrtb_i32,
+    Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, JsonField, OpenRtbRequest,
+    Publisher, Regs, RegsExt, Site, ToExt as _, TrustedServerExt, User, UserExt,
+    impression_extension, regs_extension, request_extension, to_openrtb_i32, user_extension,
 };
 use crate::request_signing::{RequestSigner, SIGNING_VERSION, SigningParams};
 
@@ -371,7 +372,8 @@ fn build_common_request(
                 .flatten(),
             eids: common.user.eids.clone(),
         }
-        .to_ext(),
+        .to_ext()
+        .map(user_extension),
         ..Default::default()
     });
     let language = normalized_language(routed.prebid_transport_headers(), policy);
@@ -383,35 +385,48 @@ fn build_common_request(
             ip: device.ip.clone(),
             geo: device.geo.as_ref().map(|geo| Geo {
                 country: Some(geo.country.clone()),
-                region: geo.region.clone(),
-                city: Some(geo.city.clone()),
                 lat: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.latitude),
                 lon: matches!(policy, ProfilePolicy::Prebid(_)).then_some(geo.longitude),
-                metro: (geo.metro_code > 0).then(|| geo.metro_code.to_string()),
-                r#type: Some(2),
+                other: [
+                    ("type", Some(json!(2))),
+                    ("city", Some(json!(geo.city))),
+                    ("region", geo.region.as_ref().map(|region| json!(region))),
+                    (
+                        "metro",
+                        (geo.metro_code > 0).then(|| json!(geo.metro_code.to_string())),
+                    ),
+                ]
+                .into_iter()
+                .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
+                .collect(),
                 ..Default::default()
             }),
-            dnt: routed.dnt(),
-            language: language.clone(),
+            dnt: routed.dnt().map(i32::from),
+            language: language
+                .clone()
+                .map_or(JsonField::Missing, JsonField::Value),
             ..Default::default()
         })
         .or_else(|| {
             (routed.dnt().is_some() || language.is_some()).then_some(Device {
-                dnt: routed.dnt(),
-                language,
+                dnt: routed.dnt().map(i32::from),
+                language: language.map_or(JsonField::Missing, JsonField::Value),
                 ..Default::default()
             })
         });
 
     OpenRtbRequest {
-        id: Some(common.id.clone()),
+        id: common.id.clone(),
         imp: imps,
         site: Some(Site {
             domain: Some(site_domain.clone()),
             page,
-            r#ref: matches!(policy, ProfilePolicy::Prebid(_))
+            other: matches!(policy, ProfilePolicy::Prebid(_))
                 .then(|| header_string(routed.prebid_transport_headers().referer()))
-                .flatten(),
+                .flatten()
+                .map(|reference| ("ref".to_string(), Value::String(reference)))
+                .into_iter()
+                .collect(),
             publisher: Some(Publisher {
                 domain: Some(site_domain),
                 ..Default::default()
@@ -422,14 +437,15 @@ fn build_common_request(
         device,
         regs: build_regs(body_consent, policy),
         test: match policy {
-            ProfilePolicy::Prebid(plan) => plan.test_mode.then_some(true),
+            ProfilePolicy::Prebid(plan) => plan.test_mode.then_some(1),
             _ => None,
         },
         tmax: to_openrtb_i32(
             effective_timeout_ms,
             "tmax",
             "config-first provider request",
-        ),
+        )
+        .map(i64::from),
         cur: vec![DEFAULT_CURRENCY.to_string()],
         ..Default::default()
     }
@@ -441,33 +457,40 @@ fn build_imp(slot: &ProviderSlotInput, policy: ProfilePolicy<'_>) -> Option<Imp>
         .formats
         .iter()
         .filter_map(|format| {
+            let width = to_openrtb_i32(format.width, "format.w", "routed slot");
+            let height = to_openrtb_i32(format.height, "format.h", "routed slot");
             Some(Format {
-                w: to_openrtb_i32(format.width, "format.w", "routed slot"),
-                h: to_openrtb_i32(format.height, "format.h", "routed slot"),
+                w: width?,
+                h: height?,
                 ..Default::default()
             })
-            .filter(|value| value.w.is_some() && value.h.is_some())
         })
         .collect::<Vec<_>>();
     let first_width = formats.first()?.w;
     let first_height = formats.first()?.h;
     let aps_banner = matches!(policy, ProfilePolicy::Aps(_));
     Some(Imp {
-        id: Some(slot.slot().id.clone()),
+        id: slot.slot().id.clone(),
         banner: Some(Banner {
             format: formats,
-            w: aps_banner.then_some(first_width).flatten(),
-            h: aps_banner.then_some(first_height).flatten(),
-            topframe: aps_banner.then_some(false),
+            w: aps_banner.then_some(first_width),
+            h: aps_banner.then_some(first_height),
+            other: aps_banner
+                .then(|| ("topframe".to_string(), json!(0)))
+                .into_iter()
+                .collect(),
             ..Default::default()
         }),
-        tagid: matches!(policy, ProfilePolicy::Prebid(_)).then(|| slot.slot().id.clone()),
+        other: matches!(policy, ProfilePolicy::Prebid(_))
+            .then(|| ("tagid".to_string(), json!(slot.slot().id)))
+            .into_iter()
+            .collect(),
         bidfloor: slot.slot().floor_price,
         bidfloorcur: slot
             .slot()
             .floor_price
             .map(|_| DEFAULT_CURRENCY.to_string()),
-        secure: Some(true),
+        secure: Some(1),
         ..Default::default()
     })
 }
@@ -476,9 +499,9 @@ fn apply_standard(
     request: &mut OpenRtbRequest,
     plan: &StandardProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
-    request.ext = nonempty_map(plan.request_ext.as_object().clone());
+    request.ext = nonempty_map(plan.request_ext.as_object().clone()).map(request_extension);
     for imp in &mut request.imp {
-        imp.ext = nonempty_map(plan.imp_ext.as_object().clone());
+        imp.ext = nonempty_map(plan.imp_ext.as_object().clone()).map(impression_extension);
     }
     Ok(())
 }
@@ -526,10 +549,10 @@ fn apply_prebid(
             if prebid.is_empty() {
                 return None;
             }
-            imp.ext = Some(Map::from_iter([(
+            imp.ext = Some(impression_extension(Map::from_iter([(
                 "prebid".to_string(),
                 Value::Object(prebid),
-            )]));
+            )])));
             Some(imp)
         })
         .collect();
@@ -538,10 +561,10 @@ fn apply_prebid(
         prebid_request.insert("debug".to_string(), Value::Bool(true));
         prebid_request.insert("returnallbidstatus".to_string(), Value::Bool(true));
     }
-    request.ext = Some(Map::from_iter([(
+    request.ext = Some(request_extension(Map::from_iter([(
         "prebid".to_string(),
         Value::Object(prebid_request),
-    )]));
+    )])));
     Ok(())
 }
 
@@ -549,7 +572,7 @@ fn apply_aps(
     request: &mut OpenRtbRequest,
     plan: &ApsProfilePlan,
 ) -> Result<(), Report<TrustedServerError>> {
-    request.ext = Some(Map::from_iter([
+    request.ext = Some(request_extension(Map::from_iter([
         (
             "account".to_string(),
             Value::String(plan.account_id.clone()),
@@ -558,7 +581,7 @@ fn apply_aps(
             "sdk".to_string(),
             json!({"source": APS_SDK_SOURCE, "version": APS_SDK_VERSION}),
         ),
-    ]));
+    ])));
     Ok(())
 }
 
@@ -567,12 +590,8 @@ fn finalize_request(
     policy: ProfilePolicy<'_>,
     finalization: &RequestFinalization<'_>,
 ) -> Result<(), Report<TrustedServerError>> {
-    let request_id = request.id.as_deref().ok_or_else(|| {
-        Report::new(TrustedServerError::Auction {
-            message: "OpenRTB request ID must be fixed before signing".to_string(),
-        })
-    })?;
-    if request_id != finalization.signing_params.request_id {
+    let request_id = &request.id;
+    if request_id != &finalization.signing_params.request_id {
         return Err(Report::new(TrustedServerError::Auction {
             message: "OpenRTB signing params do not bind the fixed request ID".to_string(),
         }));
@@ -600,13 +619,13 @@ fn finalize_request(
         None
     };
     if let Some(trusted_server) = trusted_server {
-        let ext = request.ext.get_or_insert_with(Map::new);
+        let ext = request.ext.get_or_insert_with(Default::default);
         let serialized = serde_json::to_value(trusted_server).map_err(|error| {
             Report::new(TrustedServerError::Auction {
                 message: format!("Failed to serialize Trusted Server extension: {error}"),
             })
         })?;
-        ext.insert("trusted_server".to_string(), serialized);
+        ext.other.insert("trusted_server".to_string(), serialized);
     }
     Ok(())
 }
@@ -627,15 +646,16 @@ fn build_regs(
         };
         return Some(Regs {
             coppa: None,
-            gdpr: Some(consent.gdpr_applies),
+            gdpr: Some(i32::from(consent.gdpr_applies)),
             us_privacy: ext.us_privacy.clone(),
             gpp: ext.gpp.clone(),
             gpp_sid: ext
                 .gpp_sid
                 .as_ref()
-                .map(|ids| ids.iter().copied().map(i32::from).collect())
-                .unwrap_or_default(),
-            ext: ext.to_ext(),
+                .map(|ids| ids.iter().copied().map(i32::from).collect::<Vec<_>>())
+                .filter(|ids| !ids.is_empty()),
+            ext: ext.to_ext().map(regs_extension),
+            ..Default::default()
         });
     }
 
@@ -674,13 +694,14 @@ fn build_regs(
     };
     Some(Regs {
         coppa: None,
-        gdpr,
+        gdpr: gdpr.map(i32::from),
         us_privacy,
         gpp,
         gpp_sid: gpp_sid
-            .map(|ids| ids.into_iter().map(i32::from).collect())
-            .unwrap_or_default(),
-        ext: ext.to_ext(),
+            .map(|ids| ids.into_iter().map(i32::from).collect::<Vec<_>>())
+            .filter(|ids| !ids.is_empty()),
+        ext: ext.to_ext().map(regs_extension),
+        ..Default::default()
     })
 }
 

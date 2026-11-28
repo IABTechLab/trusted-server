@@ -234,6 +234,153 @@ describe('installTsAdInit', () => {
   });
 
   it.each(['bootstrap', 'bundle'] as const)(
+    'preserves auctioneer targeting and host render identity in %s delivery',
+    async (implementation) => {
+      const selected = {
+        hb_pb: '0.00',
+        hb_bidder: 'engine-seat',
+        custom_pb: '1.234',
+        custom_deal: 'deal-1',
+        custom_size: '300x250',
+        custom_format: 'banner',
+        custom_bidder_seat: 'fictional',
+        custom_empty: '',
+        hb_adid: 'unbacked-engine-id',
+        hb_cache_host: 'unbacked.example',
+        hb_cache_path: '/unbacked',
+        ts_initial: 'unbacked',
+      };
+      const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: 'legacy-price',
+          hb_bidder: 'legacy-seat',
+          hb_adid: 'host-ad',
+          hb_cache_host: 'cache.example',
+          hb_cache_path: '/cache',
+          adm: '<div>Example</div>',
+          targeting: selected,
+        },
+        vi.fn()
+      );
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      ts.adSlots![0]!.targeting = {
+        custom_pb: 'slot-price',
+        hb_pb: 'slot-price',
+        section: 'front',
+      };
+      await installHandoff(implementation);
+      ts.adInit!();
+      const applied = Object.fromEntries(mockSlot.setTargeting.mock.calls);
+      expect(applied).toEqual({
+        ...selected,
+        section: 'front',
+        hb_adid: 'host-ad',
+        hb_cache_host: 'cache.example',
+        hb_cache_path: '/cache',
+        ts_initial: '1',
+      });
+      expect(ts.prevSlotTargetingKeys!['div-atf-sidebar'].slice().sort()).toEqual(
+        Object.keys(applied).sort()
+      );
+      expect(mockSlot.setTargeting.mock.invocationCallOrder.slice(-1)[0]).toBeLessThan(
+        mockPubads.refresh.mock.invocationCallOrder[0]
+      );
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'ignores malformed auctioneer targeting in %s publisher delivery',
+    async (implementation) => {
+      const { mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: 'legacy-price',
+          hb_adid: 'host-ad',
+          targeting: { hb_pb: 'engine-price', invalid: [] } as unknown as Record<string, string>,
+        },
+        vi.fn()
+      );
+      await installHandoff(implementation);
+      (window as TestWindow).tsjs!.adInit!();
+      expect(Object.fromEntries(mockSlot.setTargeting.mock.calls)).toEqual({
+        hb_pb: 'legacy-price',
+        hb_adid: 'host-ad',
+        ts_initial: '1',
+      });
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'keeps auctioneer targeting from inventing host render identity in %s delivery',
+    async (implementation) => {
+      const { mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: '1.00',
+          targeting: {
+            custom_pb: '1.00',
+            hb_adid: 'unbacked',
+            hb_cache_host: 'unbacked.example',
+            hb_cache_path: '/unbacked',
+          },
+        },
+        vi.fn()
+      );
+      await installHandoff(implementation);
+      (window as TestWindow).tsjs!.adInit!();
+      expect(Object.fromEntries(mockSlot.setTargeting.mock.calls)).toEqual({
+        hb_pb: '1.00',
+        custom_pb: '1.00',
+        ts_initial: '1',
+      });
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
+    'clears all auctioneer targeting on %s to bundle navigation with a remote winner or no bid',
+    async (implementation) => {
+      const { mockSlot } = configureOpportunityDiagnostics(
+        {
+          hb_pb: '1.00',
+          hb_adid: 'host-ad',
+          targeting: { custom_deal: 'deal-1', custom_pb: '1.00' },
+        },
+        vi.fn()
+      );
+      const values = new Map<string, string | string[]>([['publisher_key', 'retain']]);
+      mockSlot.setTargeting.mockImplementation((key: string, value: string | string[]) => {
+        values.set(key, value);
+        return mockSlot;
+      });
+      mockSlot.clearTargeting.mockImplementation((key: string) => {
+        values.delete(key);
+        return mockSlot;
+      });
+      const ts = (window as TestWindow).tsjs as TsjsApi;
+      await installHandoff(implementation);
+      ts.adInit!();
+      expect(values.get('custom_deal')).toBe('deal-1');
+      ts.navGeneration = 1;
+      ts.firstImpression = undefined;
+      ts.bids = {
+        atf_sidebar_ad: { hb_pb: '2.00', hb_adid: 'remote-ad', hb_bidder: 'remote-seat' },
+      };
+      const { installTsAdInit } = await import('../../../src/integrations/gpt/index');
+      installTsAdInit();
+      ts.adInit!();
+      expect(values.has('custom_deal')).toBe(false);
+      expect(values.has('custom_pb')).toBe(false);
+      expect(values.get('hb_pb')).toBe('2.00');
+      expect(values.get('publisher_key')).toBe('retain');
+      ts.navGeneration = 2;
+      ts.firstImpression = undefined;
+      ts.adSlots = [];
+      ts.bids = {};
+      ts.adInit!();
+      expect(values.has('hb_pb')).toBe(false);
+      expect(values.get('publisher_key')).toBe('retain');
+    }
+  );
+
+  it.each(['bootstrap', 'bundle'] as const)(
     'binds the actual GPT cycle to the exact delivered slot in %s adInit',
     async (implementation) => {
       const { mockSlot } = configureOpportunityDiagnostics(undefined, vi.fn());
@@ -275,7 +422,12 @@ describe('installTsAdInit', () => {
       vi.useFakeTimers();
       try {
         const { mockPubads, mockSlot } = configureOpportunityDiagnostics(
-          { hb_pb: '1.10', hb_adid: 'example-creative', adm: '<div>Example</div>' },
+          {
+            hb_pb: '1.10',
+            hb_adid: 'example-creative',
+            adm: '<div>Example</div>',
+            targeting: { custom_pb: '1.10', custom_deal: 'deal-1' },
+          },
           vi.fn()
         );
         const ts = (window as TestWindow).tsjs as TsjsApi;
@@ -294,6 +446,10 @@ describe('installTsAdInit', () => {
         expect(collector.snapshot().value?.slotCorrelations).toEqual([]);
         vi.advanceTimersByTime(5001);
         expect(mockPubads.refresh).toHaveBeenCalledOnce();
+        expect(mockSlot.setTargeting).toHaveBeenCalledWith('custom_deal', 'deal-1');
+        expect(ts.prevSlotTargetingKeys!['div-atf-sidebar'].slice().sort()).toEqual(
+          Object.keys(Object.fromEntries(mockSlot.setTargeting.mock.calls)).sort()
+        );
         store.recordSlotRequested(mockSlot);
         expect(collector.snapshot().value?.slotCorrelations).toEqual([
           {

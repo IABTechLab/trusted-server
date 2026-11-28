@@ -53,8 +53,9 @@ use crate::integrations::{
 #[cfg(test)]
 use crate::openrtb::{
     Banner, ConsentedProvidersSettings, Device, Format, Geo, Imp, ImpExt, ImpStoredRequest,
-    OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site, ToExt,
-    TrustedServerExt, User, UserExt, to_openrtb_i32,
+    JsonField, OpenRtbRequest, PrebidExt, PrebidImpExt, Publisher, Regs, RegsExt, RequestExt, Site,
+    ToExt, TrustedServerExt, User, UserExt, impression_extension, regs_extension,
+    request_extension, to_openrtb_i32, user_extension,
 };
 #[cfg(test)]
 use crate::outbound::{DEFAULT_BUFFERED_RESPONSE_BYTES, buffered, outbound_request};
@@ -2644,8 +2645,8 @@ impl PrebidAuctionProvider {
 
                         match (width, height) {
                             (Some(width), Some(height)) => Some(Format {
-                                w: Some(width),
-                                h: Some(height),
+                                w: width,
+                                h: height,
                                 ..Default::default()
                             }),
                             _ => None,
@@ -2823,7 +2824,7 @@ impl PrebidAuctionProvider {
                 };
 
                 Some(Imp {
-                    id: Some(slot.id.clone()),
+                    id: slot.id.clone(),
                     banner: Some(Banner {
                         format: formats,
                         ..Default::default()
@@ -2833,15 +2834,16 @@ impl PrebidAuctionProvider {
                     // multi-currency support is needed, this should come from
                     // config or the AdSlot itself.
                     bidfloorcur: slot.floor_price.map(|_| DEFAULT_CURRENCY.to_string()),
-                    secure: Some(true), // require HTTPS creatives
-                    tagid: Some(slot.id.clone()),
+                    // Require HTTPS creatives.
+                    secure: Some(1),
+                    other: [("tagid".to_string(), Json::String(slot.id.clone()))].into_iter().collect(),
                     ext: ImpExt {
                         prebid: PrebidImpExt {
                             bidder,
                             storedrequest,
                         },
                     }
-                    .to_ext(),
+                    .to_ext().map(impression_extension),
                     ..Default::default()
                 })
             })
@@ -2883,7 +2885,8 @@ impl PrebidAuctionProvider {
                 // in `handle_auction` via `gate_eids_by_consent`.
                 eids: request.user.eids.clone(),
             }
-            .to_ext(),
+            .to_ext()
+            .map(user_extension),
             ..Default::default()
         });
 
@@ -2939,33 +2942,35 @@ impl PrebidAuctionProvider {
                 ip: d.ip.clone(),
                 geo: d.geo.as_ref().map(|geo| Geo {
                     country: Some(geo.country.clone()),
-                    city: Some(geo.city.clone()),
-                    region: geo.region.clone(),
                     lat: Some(geo.latitude),
                     lon: Some(geo.longitude),
-                    // DMA/metro code: convert i64 to string for OpenRTB.
-                    // Fastly returns 0 for "no metro code"; negative values
-                    // are not realistic for DMA codes so the > 0 guard is
-                    // sufficient.
-                    metro: if geo.metro_code > 0 {
-                        Some(geo.metro_code.to_string())
-                    } else {
-                        None
-                    },
-                    r#type: Some(2),
+                    other: [
+                        ("type", Some(Json::from(2))),
+                        ("city", Some(Json::String(geo.city.clone()))),
+                        ("region", geo.region.clone().map(Json::String)),
+                        (
+                            "metro",
+                            (geo.metro_code > 0).then(|| Json::String(geo.metro_code.to_string())),
+                        ),
+                    ]
+                    .into_iter()
+                    .filter_map(|(key, value)| value.map(|value| (key.to_string(), value)))
+                    .collect(),
                     ..Default::default()
                 }),
-                dnt,
+                dnt: dnt.map(i32::from),
                 // Clone needed: `language` is also used in the `or_else`
                 // fallback below when `request.device` is `None`.
-                language: language.clone(),
+                language: language
+                    .clone()
+                    .map_or(JsonField::Missing, JsonField::Value),
                 ..Default::default()
             })
             .or_else(|| {
                 if dnt.is_some() || language.is_some() {
                     Some(Device {
-                        dnt,
-                        language,
+                        dnt: dnt.map(i32::from),
+                        language: language.map_or(JsonField::Missing, JsonField::Value),
                         ..Default::default()
                     })
                 } else {
@@ -3005,7 +3010,8 @@ impl PrebidAuctionProvider {
                 ts,
             }),
         }
-        .to_ext();
+        .to_ext()
+        .map(request_extension);
 
         // Extract Referer header for site.ref
         let referer = context
@@ -3020,15 +3026,18 @@ impl PrebidAuctionProvider {
         // budget, and the edge backend stops waiting after that long. Telling
         // PBS it has more time than the edge will wait turns partial bids into
         // edge timeouts.
-        let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request");
+        let tmax = to_openrtb_i32(context.timeout_ms, "tmax", "request").map(i64::from);
 
         let request = OpenRtbRequest {
-            id: Some(request.id.clone()),
+            id: request.id.clone(),
             imp: imps,
             site: Some(Site {
                 domain: Some(request.publisher.domain.clone()),
                 page: page_url,
-                r#ref: referer,
+                other: referer
+                    .map(|reference| ("ref".to_string(), Json::String(reference)))
+                    .into_iter()
+                    .collect(),
                 publisher: Some(Publisher {
                     domain: Some(request.publisher.domain.clone()),
                     ..Default::default()
@@ -3038,7 +3047,7 @@ impl PrebidAuctionProvider {
             user,
             device,
             regs,
-            test: self.config.test_mode.then_some(true),
+            test: self.config.test_mode.then_some(1),
             tmax,
             cur: vec![DEFAULT_CURRENCY.to_string()],
             ext,
@@ -3111,8 +3120,7 @@ impl PrebidAuctionProvider {
         let gpp = ctx.raw_gpp_string.clone();
         let gpp_sid = ctx.gpp_section_ids.clone();
 
-        // RegsExt uses u8 for GDPR (Prebid convention) while the top-level
-        // Regs uses bool (OpenRTB proto). Map accordingly.
+        // Preserve integer GDPR signals in both wire locations.
         let gdpr_u8 = gdpr.map(u8::from);
         let gpp_sid_u16 = gpp_sid.clone();
         let ext = RegsExt {
@@ -3124,13 +3132,14 @@ impl PrebidAuctionProvider {
 
         Some(Regs {
             coppa: None,
-            gdpr,
+            gdpr: gdpr.map(i32::from),
             us_privacy,
             gpp,
             gpp_sid: gpp_sid
-                .map(|ids| ids.into_iter().map(i32::from).collect())
-                .unwrap_or_default(),
-            ext: ext.to_ext(),
+                .map(|ids| ids.into_iter().map(i32::from).collect::<Vec<_>>())
+                .filter(|ids| !ids.is_empty()),
+            ext: ext.to_ext().map(regs_extension),
+            ..Default::default()
         })
     }
 
@@ -5918,7 +5927,7 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             openrtb.test,
-            Some(true),
+            Some(1),
             "should set top-level OpenRTB test field when test_mode is enabled"
         );
 
@@ -6087,9 +6096,9 @@ external_bundle_sri = "sha384-AAAA"
         );
         let imp = &openrtb.imp[0];
 
-        assert_eq!(imp.secure, Some(true), "should require HTTPS creatives");
+        assert_eq!(imp.secure, Some(1), "should require HTTPS creatives");
         assert_eq!(
-            imp.tagid.as_deref(),
+            imp.other.get("tagid").and_then(Json::as_str),
             Some("slot-1"),
             "should set tagid from slot id"
         );
@@ -6138,7 +6147,7 @@ external_bundle_sri = "sha384-AAAA"
         );
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
-            Some(true),
+            Some(1),
             "should set regs.gdpr=true for EU country"
         );
     }
@@ -6178,7 +6187,7 @@ external_bundle_sri = "sha384-AAAA"
             "cookies_only should carry policy-sourced consent in the body"
         );
         let regs = openrtb.regs.as_ref().expect("should include consent regs");
-        assert_eq!(regs.gdpr, Some(true), "should carry GDPR applicability");
+        assert_eq!(regs.gdpr, Some(1), "should carry GDPR applicability");
         assert_eq!(
             regs.us_privacy.as_deref(),
             Some("1YNN"),
@@ -6227,7 +6236,7 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
-            Some(true),
+            Some(1),
             "should set regs.gdpr=true when consent string present, even for non-EU geo"
         );
     }
@@ -6294,7 +6303,7 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             openrtb.regs.as_ref().and_then(|r| r.gdpr),
-            Some(true),
+            Some(1),
             "should conservatively assume GDPR when geo is absent but consent exists"
         );
     }
@@ -6390,7 +6399,7 @@ external_bundle_sri = "sha384-AAAA"
         );
         assert_eq!(
             regs.gpp_sid,
-            vec![2i32, 6i32],
+            Some(vec![2i32, 6i32]),
             "should convert gpp_sid u16 to i32"
         );
 
@@ -6400,12 +6409,12 @@ external_bundle_sri = "sha384-AAAA"
             .as_ref()
             .expect("should have ext for dual-placement");
         assert_eq!(
-            ext.get("gpp").and_then(|v| v.as_str()),
+            ext.other.get("gpp").and_then(|v| v.as_str()),
             Some("DBACNYA~CPXxRfA"),
             "should mirror gpp in regs.ext"
         );
         assert_eq!(
-            ext.get("gpp_sid"),
+            ext.other.get("gpp_sid"),
             Some(&serde_json::json!([2, 6])),
             "should mirror gpp_sid in regs.ext"
         );
@@ -6427,7 +6436,7 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             regs.gdpr,
-            Some(true),
+            Some(1),
             "should set gdpr=true from GDPR jurisdiction even without TCF string"
         );
     }
@@ -6466,7 +6475,7 @@ external_bundle_sri = "sha384-AAAA"
 
         assert_eq!(
             regs.gdpr,
-            Some(false),
+            Some(0),
             "should set gdpr=false for non-regulated jurisdiction"
         );
     }
@@ -6492,30 +6501,30 @@ external_bundle_sri = "sha384-AAAA"
 
         // Top-level uses bool (OpenRTB proto); ext uses integer (Prebid convention).
         // Both serialize to the same JSON value (1).
-        assert_eq!(regs.gdpr, Some(true), "top-level gdpr should be true");
+        assert_eq!(regs.gdpr, Some(1), "top-level gdpr should be true");
         assert_eq!(
-            ext.get("gdpr").and_then(serde_json::Value::as_u64),
+            ext.other.get("gdpr").and_then(serde_json::Value::as_u64),
             Some(1),
             "ext.gdpr should be 1 (mirroring top-level)"
         );
 
         assert_eq!(regs.us_privacy.as_deref(), Some("1YNN"));
         assert_eq!(
-            ext.get("us_privacy").and_then(|v| v.as_str()),
+            ext.other.get("us_privacy").and_then(|v| v.as_str()),
             Some("1YNN"),
             "ext.us_privacy should mirror top-level"
         );
 
         assert_eq!(regs.gpp.as_deref(), Some("DBACNYA~CPXxRfA"));
         assert_eq!(
-            ext.get("gpp").and_then(|v| v.as_str()),
+            ext.other.get("gpp").and_then(|v| v.as_str()),
             Some("DBACNYA~CPXxRfA"),
             "ext.gpp should mirror top-level"
         );
 
-        assert_eq!(regs.gpp_sid, vec![7i32]);
+        assert_eq!(regs.gpp_sid, Some(vec![7i32]));
         assert_eq!(
-            ext.get("gpp_sid"),
+            ext.other.get("gpp_sid"),
             Some(&serde_json::json!([7])),
             "ext.gpp_sid should mirror top-level"
         );
@@ -6534,10 +6543,13 @@ external_bundle_sri = "sha384-AAAA"
         let regs = PrebidAuctionProvider::build_regs(Some(&ctx))
             .expect("should produce regs for gdpr_applies");
 
-        assert_eq!(regs.gdpr, Some(true));
+        assert_eq!(regs.gdpr, Some(1));
         // ext should exist because RegsExt has gdpr=Some(1)
         let ext = regs.ext.as_ref().expect("should have ext when gdpr is set");
-        assert_eq!(ext.get("gdpr").and_then(serde_json::Value::as_u64), Some(1));
+        assert_eq!(
+            ext.other.get("gdpr").and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
     }
 
     #[test]
@@ -6565,7 +6577,7 @@ external_bundle_sri = "sha384-AAAA"
         );
         let device = openrtb.device.as_ref().expect("should have device");
 
-        assert_eq!(device.dnt, Some(true), "should set dnt from DNT header");
+        assert_eq!(device.dnt, Some(1), "should set dnt from DNT header");
     }
 
     #[test]
@@ -6595,7 +6607,7 @@ external_bundle_sri = "sha384-AAAA"
         let device = openrtb.device.as_ref().expect("should have device");
 
         assert_eq!(
-            device.language.as_deref(),
+            device.language.as_ref().map(String::as_str),
             Some("en"),
             "should extract primary ISO-639 language tag (stripped of locale subtag)"
         );
@@ -6627,8 +6639,8 @@ external_bundle_sri = "sha384-AAAA"
         );
         let device = openrtb.device.as_ref().expect("should have device");
 
-        assert_eq!(
-            device.language, None,
+        assert!(
+            device.language.is_missing(),
             "empty Accept-Language header should not produce Some(\"\")"
         );
     }
@@ -6706,13 +6718,16 @@ external_bundle_sri = "sha384-AAAA"
         assert_eq!(geo.lat, Some(40.7128), "should set latitude");
         assert_eq!(geo.lon, Some(-74.006), "should set longitude");
         assert_eq!(
-            geo.metro.as_deref(),
+            geo.other.get("metro").and_then(Json::as_str),
             Some("501"),
             "should set metro (DMA code)"
         );
         assert_eq!(geo.country.as_deref(), Some("US"));
-        assert_eq!(geo.city.as_deref(), Some("New York"));
-        assert_eq!(geo.region.as_deref(), Some("NY"));
+        assert_eq!(
+            geo.other.get("city").and_then(Json::as_str),
+            Some("New York")
+        );
+        assert_eq!(geo.other.get("region").and_then(Json::as_str), Some("NY"));
     }
 
     #[test]
@@ -6855,8 +6870,8 @@ external_bundle_sri = "sha384-AAAA"
             1,
             "should keep only valid banner formats when one is out of range"
         );
-        assert_eq!(formats[0].w, Some(300), "should preserve valid width");
-        assert_eq!(formats[0].h, Some(250), "should preserve valid height");
+        assert_eq!(formats[0].w, 300, "should preserve valid width");
+        assert_eq!(formats[0].h, 250, "should preserve valid height");
     }
 
     #[test]
@@ -6913,7 +6928,7 @@ external_bundle_sri = "sha384-AAAA"
         let site = openrtb.site.as_ref().expect("should have site");
 
         assert_eq!(
-            site.r#ref.as_deref(),
+            site.other.get("ref").and_then(Json::as_str),
             Some("https://google.com/search?q=test"),
             "should set site.ref from Referer header"
         );
@@ -6953,28 +6968,34 @@ external_bundle_sri = "sha384-AAAA"
         let mut auction_request = create_test_auction_request();
         auction_request.user.eids = Some(vec![
             crate::openrtb::Eid {
-                source: "liveramp.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                source: Some("liveramp.com".to_owned()),
+                uids: Some(vec![crate::openrtb::Uid {
                     id: "LR_xyz".to_owned(),
                     atype: Some(3),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             crate::openrtb::Eid {
-                source: "id5-sync.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                source: Some("id5-sync.com".to_owned()),
+                uids: Some(vec![crate::openrtb::Uid {
                     id: "ID5_abc".to_owned(),
                     atype: Some(1),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
             crate::openrtb::Eid {
-                source: "google.com".to_owned(),
-                uids: vec![crate::openrtb::Uid {
+                source: Some("google.com".to_owned()),
+                uids: Some(vec![crate::openrtb::Uid {
                     id: "pair-id".to_owned(),
                     atype: Some(571187),
                     ext: None,
-                }],
+                    ..Default::default()
+                }]),
+                ..Default::default()
             },
         ]);
 
@@ -7536,7 +7557,8 @@ external_bundle_sri = "sha384-AAAA"
 
     fn bidder_params(ortb: &OpenRtbRequest) -> &serde_json::Map<String, Json> {
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        ext.get("prebid")
+        ext.other
+            .get("prebid")
             .and_then(|p| p.get("bidder"))
             .and_then(|b| b.as_object())
             .expect("should have prebid.bidder in imp ext")
@@ -7547,7 +7569,7 @@ external_bundle_sri = "sha384-AAAA"
     /// typos at compile time.
     fn get_prebid_ext(req: &OpenRtbRequest) -> PrebidExt {
         let ext = req.ext.as_ref().expect("should have request ext");
-        serde_json::from_value(ext["prebid"].clone()).expect("should deserialise ext.prebid")
+        serde_json::from_value(ext.other["prebid"].clone()).expect("should deserialise ext.prebid")
     }
 
     // ========================================================================
@@ -8610,7 +8632,7 @@ set = { placementId = "explicit_header" }
 
         let ortb = call_to_openrtb(base_config(), &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert_eq!(
             prebid["storedrequest"]["id"], "homepage_header_ad",
@@ -8632,7 +8654,7 @@ set = { placementId = "explicit_header" }
 
         let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("storedrequest").is_none(),
@@ -8750,7 +8772,7 @@ bidders = ["kargo"]
 
         let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
@@ -8823,7 +8845,7 @@ bidders = ["kargo"]
 
         let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
@@ -8860,7 +8882,7 @@ bidders = ["appnexus"]
 
         let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
@@ -8919,7 +8941,7 @@ bidders = ["kargo", "triplelift"]
 
         let ortb = call_to_openrtb(config, &request);
         let ext = ortb.imp[0].ext.as_ref().expect("should have imp ext");
-        let prebid = ext.get("prebid").expect("should have prebid in ext");
+        let prebid = ext.other.get("prebid").expect("should have prebid in ext");
 
         assert!(
             prebid.get("bidder").is_none(),
@@ -9330,6 +9352,137 @@ set = { networkId = 42 }
             parsed.metadata["response_admission"]["rejection_reasons"]["invalid_bid"], 1,
             "should report the invalid bid"
         );
+    }
+
+    #[test]
+    fn openrtb_shared_types_admission_prebid_preserves_cache_and_siblings() {
+        let provider = PrebidAuctionProvider::new(base_config());
+        let input = planned_prebid_input(&["fictional-slot"]);
+        let profile = planned_prebid_profile(false);
+        let wire = json!({
+            "id": "unrelated-response",
+            "seatbid": [{
+                "seat": "fictional-seat",
+                "bid": [{
+                    "id": null,
+                    "impid": "fictional-slot",
+                    "price": 1.5,
+                    "adm": "<div>Fictional ad</div>",
+                    "w": 300,
+                    "h": 250,
+                    "adomain": ["advertiser.example", 42],
+                    "nurl": "https://notifications.example/win",
+                    "burl": "https://notifications.example/bill",
+                    "adid": "fictional-ad",
+                    "crid": "fictional-creative",
+                    "ext": {
+                        "prebid": {"cache": {"bids": {
+                            "cacheId": "fictional-cache",
+                            "url": "https://cache.example/cache?discard=query"
+                        }}},
+                        "unknown": {"private": "do-not-forward"}
+                    }
+                }, {
+                    "id": "malformed",
+                    "impid": "fictional-slot",
+                    "price": "invalid",
+                    "w": 300,
+                    "h": 250
+                }]
+            }],
+            "ext": {
+                "responsetimemillis": {"fictional-seat": 9},
+                "errors": {"fictional-seat": []},
+                "warnings": {"fictional-seat": ["fictional-warning"]},
+                "debug": {"private": "do-not-forward"},
+                "prebid": {"bidstatus": [{"private": "do-not-forward"}]}
+            }
+        });
+        for malformed_first in [false, true] {
+            let mut wire = wire.clone();
+            if malformed_first {
+                wire["seatbid"][0]["bid"]
+                    .as_array_mut()
+                    .expect("should contain PBS sibling fixtures")
+                    .reverse();
+            }
+            let mut legacy = provider.parse_openrtb_response(&wire, 9);
+            provider.enrich_response_metadata(&wire, &mut legacy);
+            let mut planned = parse_planned_prebid_openrtb("pbs-instance", &input, &wire, 9);
+            enrich_planned_prebid_metadata(&profile, &wire, &mut planned);
+
+            assert_eq!(
+                legacy.bids.len(),
+                1,
+                "should retain the valid legacy PBS sibling"
+            );
+            assert_eq!(
+                planned.bids.len(),
+                1,
+                "should retain the valid planned PBS sibling"
+            );
+            assert!(
+                legacy.bids[0].returned_seat.is_none(),
+                "should preserve the legacy seat contract"
+            );
+            assert_eq!(
+                planned.bids[0].returned_seat.as_deref(),
+                Some("fictional-seat"),
+                "should retain the planned upstream seat"
+            );
+            for response in [&legacy, &planned] {
+                assert_eq!(
+                    response.status,
+                    crate::auction::types::BidStatus::Success,
+                    "should retain the valid PBS sibling"
+                );
+                assert_eq!(
+                    serde_json::to_value(&response.bids)
+                        .expect("should serialize admitted PBS bids"),
+                    json!([{
+                        "slot_id": "fictional-slot",
+                        "price": 1.5,
+                        "currency": "USD",
+                        "creative": "<div>Fictional ad</div>",
+                        "adomain": ["advertiser.example"],
+                        "bidder": "fictional-seat",
+                        "width": 300,
+                        "height": 250,
+                        "nurl": "https://notifications.example/win",
+                        "burl": "https://notifications.example/bill",
+                        "ad_id": "fictional-ad",
+                        "creative_id": "fictional-creative",
+                        "cache_id": "fictional-cache",
+                        "cache_host": "cache.example",
+                        "cache_path": "/cache",
+                        "metadata": {}
+                    }]),
+                    "should preserve the complete PBS projection without inventing an ID or forwarding extensions"
+                );
+            }
+            let metadata = json!({
+                "responsetimemillis": {"fictional-seat": 9},
+                "errors": {"fictional-seat": []},
+                "warnings": {"fictional-seat": ["fictional-warning"]}
+            });
+            assert_eq!(
+                serde_json::to_value(&legacy.metadata)
+                    .expect("should serialize legacy PBS metadata"),
+                metadata,
+                "should retain permitted metadata and exclude debug data"
+            );
+            let mut planned_metadata = metadata;
+            planned_metadata["response_admission"] = json!({
+                "rejected_bid_count": 1,
+                "rejection_reasons": {"invalid_bid": 1}
+            });
+            assert_eq!(
+                serde_json::to_value(&planned.metadata)
+                    .expect("should serialize planned PBS metadata"),
+                planned_metadata,
+                "should also account for the rejected planned sibling"
+            );
+        }
     }
 
     #[test]
@@ -10204,8 +10357,8 @@ set = { networkId = 42 }
             "should retain Google Additional Consent only in PBS's existing extension"
         );
         assert_eq!(
-            disabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+            disabled_value,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#.parse::<Json>().expect("should parse pinned PBS fixture"),
             "should preserve the complete disabled PBS wire shape"
         );
 
@@ -10239,11 +10392,10 @@ set = { networkId = 42 }
             Some((&signer, signature, &signing)),
             request_info,
         );
-        let enabled =
-            serde_json::to_string(&enabled).expect("should serialize enabled PBS request");
+        let enabled = serde_json::to_value(&enabled).expect("should serialize enabled PBS request");
         assert_eq!(
             enabled,
-            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#,
+            r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"kid":"fictional-kid","request_host":"publisher.example","request_scheme":"https","signature":"LU_JUIA1BT80ShZNjSa4PIF5T-uMjEeodwKrV_6bXgh0hi1SYVtCKn9g_DTW62krmjCOFgoFYPHsu6L0nAcuDg","ts":1706900000,"version":"1.1"}}}"#.parse::<Json>().expect("should parse pinned PBS fixture"),
             "should preserve the complete enabled PBS wire shape"
         );
     }

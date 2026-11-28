@@ -283,6 +283,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1505bd5d3d116872e7271a6d4e16d81d0c8570876c8de68093a09ac269d8aac0"
 
 [[package]]
+name = "auctioneer-macros"
+version = "0.1.0"
+source = "git+https://github.com/IABTechLab/auctioneer?rev=05f2a56e9555be9c46a789c868100e37162abe5b#05f2a56e9555be9c46a789c868100e37162abe5b"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 3.0.9",
+]
+
+[[package]]
+name = "auctioneer-openrtb"
+version = "0.1.0"
+source = "git+https://github.com/IABTechLab/auctioneer?rev=05f2a56e9555be9c46a789c868100e37162abe5b#05f2a56e9555be9c46a789c868100e37162abe5b"
+dependencies = [
+ "auctioneer-macros",
+ "ipnetwork",
+ "psl",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "time",
+ "url",
+]
+
+[[package]]
 name = "autocfg"
 version = "1.5.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3701,6 +3726,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d98f6fed1fde3f8c21bc40a1abb88dd75e67924f9cffc3ef95607bad8017f8e2"
 
 [[package]]
+name = "ipnetwork"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cf370abdafd54d13e54a620e8c3e1145f28e46cc9d704bc6d94414559df41763"
+
+[[package]]
 name = "is-terminal"
 version = "0.4.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4923,6 +4954,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f94967dc7688f3054c7fac87473ffae4cc4c3904800e2d9f5b857246d8963b0a"
 dependencies = [
  "prost 0.14.4",
+]
+
+[[package]]
+name = "psl"
+version = "2.1.264"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8782e35cade255f17d5ad527b899ea5b4e6bef29dcdc3502965a7d8d2f3fc3f5"
+dependencies = [
+ "psl-types",
 ]
 
 [[package]]
@@ -6740,6 +6780,7 @@ version = "0.1.0"
 dependencies = [
  "async-stream",
  "async-trait",
+ "auctioneer-openrtb",
  "base64",
  "brotli",
  "bytes",

@@ -1,15 +1,61 @@
-use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use auctioneer_openrtb::ext::imp::ImpExt as SharedImpExt;
+use auctioneer_openrtb::ext::misc::{RegsExt as SharedRegsExt, UserExt as SharedUserExt};
+use auctioneer_openrtb::types::bid_request::BidRequestExt;
+use serde::Serialize;
+use serde_json::value::RawValue;
+use serde_json::{Map, Value};
 
 use crate::auction::types::{BidRenderer, OrchestratorExt};
 
-pub type OpenRtbRequest = trusted_server_openrtb::BidRequest;
+pub type OpenRtbRequest = auctioneer_openrtb::types::bid_request::BidRequest;
+// Response encoding waits for Auctioneer #270 to preserve omitted currency.
 pub type OpenRtbResponse = trusted_server_openrtb::BidResponse;
 pub type OpenRtbBid = trusted_server_openrtb::Bid;
 
-pub use trusted_server_openrtb::{
-    Banner, Bid, BidResponse, Device, Format, Geo, Imp, Publisher, Regs, SeatBid, Site, ToExt, User,
-};
+pub use auctioneer_openrtb::types::bid_request::{Banner, Format, Imp};
+pub use auctioneer_openrtb::types::device::{Device, Geo};
+pub use auctioneer_openrtb::types::field::JsonField;
+pub use auctioneer_openrtb::types::inventory::{Publisher, Site};
+pub use auctioneer_openrtb::types::regs::Regs;
+pub use auctioneer_openrtb::types::user::{Eid, EidUid as Uid, User};
+pub use trusted_server_openrtb::{Bid, BidResponse, SeatBid, ToExt};
+
+/// Preserve already-selected request extensions without engine interpretation.
+pub(crate) fn request_extension(other: Map<String, Value>) -> BidRequestExt {
+    BidRequestExt {
+        other,
+        ..Default::default()
+    }
+}
+
+/// Preserve already-selected impression extensions without engine interpretation.
+pub(crate) fn impression_extension(other: Map<String, Value>) -> SharedImpExt {
+    SharedImpExt {
+        other,
+        ..Default::default()
+    }
+}
+
+/// Preserve the host's permitted user extension fields and their placement.
+pub(crate) fn user_extension(other: Map<String, Value>) -> SharedUserExt {
+    SharedUserExt {
+        other,
+        ..Default::default()
+    }
+}
+
+/// Preserve the host's consent extension fields and their placement.
+pub(crate) fn regs_extension(other: Map<String, Value>) -> SharedRegsExt {
+    SharedRegsExt {
+        other,
+        ..Default::default()
+    }
+}
+
+/// Encode already-normalized extension JSON for shared UID storage.
+pub(crate) fn uid_extension(value: &Value) -> Option<Box<RawValue>> {
+    serde_json::value::to_raw_value(value).ok()
+}
 
 /// Convert a `u32` value to `i32` for `OpenRTB` fields, logging a warning and
 /// returning `None` if the value exceeds `i32::MAX`.
@@ -62,30 +108,6 @@ pub struct ConsentedProvidersSettings {
     /// The AC string value (e.g. `"2~2628.2316.3119~dv."`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub consented_providers: Option<String>,
-}
-
-/// An Extended User ID entry from an identity provider.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Eid {
-    /// Identity provider domain (e.g. `"id5-sync.com"`).
-    pub source: String,
-    /// One or more user IDs from this provider.
-    pub uids: Vec<Uid>,
-}
-
-/// A single user identifier within an [`Eid`] entry.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct Uid {
-    /// The identifier value.
-    pub id: String,
-    /// `OpenRTB` agent type, including vendor-specific values such as PAIR's `571187`.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub atype: Option<i32>,
-    /// Provider-specific extension data.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub ext: Option<Value>,
 }
 
 /// Prebid-compatible `regs.ext` consent fields.
@@ -205,8 +227,33 @@ pub struct TraceResponseExt {
 
 #[cfg(test)]
 mod tests {
+    use core::any::TypeId;
+
     use super::*;
     use crate::auction::types::OrchestratorExt;
+
+    #[test]
+    fn openrtb_shared_types_request_has_upstream_type_identity() {
+        assert_eq!(
+            TypeId::of::<OpenRtbRequest>(),
+            TypeId::of::<auctioneer_openrtb::types::bid_request::BidRequest>(),
+            "should use the shared request type in default builds"
+        );
+    }
+
+    #[test]
+    fn openrtb_shared_types_identity_entities_have_upstream_type_identity() {
+        assert_eq!(
+            TypeId::of::<Eid>(),
+            TypeId::of::<auctioneer_openrtb::types::user::Eid>(),
+            "should use the shared EID type"
+        );
+        assert_eq!(
+            TypeId::of::<Uid>(),
+            TypeId::of::<auctioneer_openrtb::types::user::EidUid>(),
+            "should use the shared UID type"
+        );
+    }
 
     #[test]
     fn openrtb_response_round_trips_with_struct_literals() {
@@ -290,15 +337,15 @@ mod tests {
         };
         let regs = Regs {
             coppa: None,
-            gdpr: Some(true),
+            gdpr: Some(1),
             us_privacy: ext.us_privacy.clone(),
             gpp: ext.gpp.clone(),
             gpp_sid: ext
                 .gpp_sid
                 .as_ref()
-                .map(|ids| ids.iter().map(|&id| i32::from(id)).collect())
-                .unwrap_or_default(),
-            ext: ext.to_ext(),
+                .map(|ids| ids.iter().map(|&id| i32::from(id)).collect()),
+            ext: ext.to_ext().map(regs_extension),
+            ..Default::default()
         };
 
         let serialized = serde_json::to_value(&regs).expect("should serialize");
@@ -369,7 +416,8 @@ mod tests {
                 }),
                 eids: None,
             }
-            .to_ext(),
+            .to_ext()
+            .map(user_extension),
             ..Default::default()
         };
 
@@ -408,12 +456,14 @@ mod tests {
     #[test]
     fn eid_serializes_correctly() {
         let eid = Eid {
-            source: "id5-sync.com".to_owned(),
-            uids: vec![Uid {
+            source: Some("id5-sync.com".to_owned()),
+            uids: Some(vec![Uid {
                 id: "ID5-abc123".to_owned(),
                 atype: Some(1),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         };
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");
@@ -432,12 +482,14 @@ mod tests {
     #[test]
     fn eid_serializes_vendor_specific_atype() {
         let eid = Eid {
-            source: "google.com".to_owned(),
-            uids: vec![Uid {
+            source: Some("google.com".to_owned()),
+            uids: Some(vec![Uid {
                 id: "pair-id".to_owned(),
                 atype: Some(571187),
                 ext: None,
-            }],
+                ..Default::default()
+            }]),
+            ..Default::default()
         };
 
         let serialized = serde_json::to_value(&eid).expect("should serialize");

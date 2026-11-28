@@ -312,7 +312,10 @@ fn language_limits_are_profile_specific() {
             Some(language),
         );
         assert_eq!(
-            request.device.and_then(|device| device.language).as_deref(),
+            request
+                .device
+                .and_then(|device| device.language.as_ref().cloned())
+                .as_deref(),
             expected
         );
     }
@@ -329,7 +332,10 @@ fn language_limits_are_profile_specific() {
             Some("en-US,en;q=0.9"),
         );
         assert_eq!(
-            request.device.and_then(|device| device.language).as_deref(),
+            request
+                .device
+                .and_then(|device| device.language.as_ref().cloned())
+                .as_deref(),
             Some("en")
         );
     }
@@ -804,8 +810,8 @@ fn pbs_driver_exact_golden_preserves_profile_policy() {
         OpenRtbBuildOutcome::NoImpressions => panic!("should retain impression"),
     };
     assert_eq!(
-        serde_json::to_string(&request).expect("should serialize PBS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#,
+        serde_json::to_value(&request).expect("should serialize PBS driver request"),
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"tagid":"fictional-slot","bidfloor":1.0,"bidfloorcur":"USD","secure":1,"ext":{"prebid":{"bidder":{"exampleBidder":{"placement":"fictional-placement"}}}}}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","ref":"https://referrer.example/story?fictional=1","publisher":{"domain":"publisher.example"}},"device":{"geo":{"lat":12.34,"lon":56.78,"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"ConsentedProvidersSettings":{"consented_providers":"fictional-ac"},"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"prebid":{},"trusted_server":{"request_host":"publisher.example","request_scheme":"https"}}}"#.parse::<Value>().expect("should parse pinned PBS driver fixture"),
         "should preserve PBS parity differences"
     );
 }
@@ -863,8 +869,8 @@ fn aps_inventory_identity_and_page_fallback_preserve_legacy_policy() {
 fn aps_driver_exact_golden_preserves_profile_policy() {
     let request = build("aps", json!({"account_id": "example-account-id"}), None);
     assert_eq!(
-        serde_json::to_string(&request).expect("should serialize APS driver request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#,
+        serde_json::to_value(&request).expect("should serialize APS driver request"),
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}],"w":300,"h":250,"topframe":0},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"account":"example-account-id","sdk":{"source":"prebid","version":"2.2.0"}}}"#.parse::<Value>().expect("should parse pinned APS driver fixture"),
         "should preserve APS parity differences"
     );
 }
@@ -917,7 +923,21 @@ fn signing_finalization_is_after_profiles_and_asserts_every_owned_key() {
 }
 
 #[test]
-fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
+fn openrtb_shared_types_preserves_signing_payload_bytes() {
+    let payload = finalization(None)
+        .signing_params
+        .build_payload("fictional-kid")
+        .expect("should build canonical signing payload");
+
+    assert_eq!(
+        payload.as_bytes(),
+        br#"{"version":"1.1","kid":"fictional-kid","host":"publisher.example","scheme":"https","id":"fictional-auction","ts":1706900000}"#,
+        "should preserve exact signing bytes independently of request field ordering"
+    );
+}
+
+#[test]
+fn signed_profiles_and_unsigned_standard_have_complete_json_goldens() {
     let signer = deterministic_signer();
     let cases = [
         (
@@ -938,21 +958,21 @@ fn signed_profiles_and_unsigned_standard_have_exact_full_goldens() {
     ];
     for (profile, config, expected) in cases {
         assert_eq!(
-            serde_json::to_string(&build(profile, config, Some(&signer)))
+            serde_json::to_value(build(profile, config, Some(&signer)))
                 .expect("should serialize signed request"),
-            expected,
-            "{profile} signed wire fixture should stay exact"
+            serde_json::from_str::<Value>(expected).expect("should parse signed baseline fixture"),
+            "should preserve every {profile} signed wire field"
         );
     }
 
     assert_eq!(
-        serde_json::to_string(&build(
+        serde_json::to_value(build(
             "standard",
             json!({"request_ext": {"fictional": true}}),
             None,
         ))
         .expect("should serialize unsigned standard request"),
-        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#,
+        r#"{"id":"fictional-auction","imp":[{"id":"fictional-slot","banner":{"format":[{"w":300,"h":250},{"w":728,"h":90}]},"bidfloor":1.0,"bidfloorcur":"USD","secure":1}],"site":{"domain":"publisher.example","page":"https://publisher.example/article","publisher":{"domain":"publisher.example"}},"device":{"geo":{"type":2,"country":"US","region":"CA","metro":"501","city":"Example City"},"dnt":1,"ua":"Fictional Browser","ip":"192.0.2.10","language":"en"},"user":{"id":"fictional-user","consent":"fictional-tcf","ext":{"consent":"fictional-tcf","eids":[{"source":"identity.example","uids":[{"atype":1,"id":"fictional-uid"}]}]}},"tmax":321,"cur":["USD"],"regs":{"gdpr":1,"us_privacy":"1YNN","gpp":"fictional-gpp","gpp_sid":[2,6],"ext":{"gdpr":1,"gpp":"fictional-gpp","gpp_sid":[2,6],"us_privacy":"1YNN"}},"ext":{"fictional":true}}"#.parse::<Value>().expect("should parse unsigned baseline fixture"),
         "unsigned standard wire fixture should stay exact"
     );
 }
@@ -1048,6 +1068,115 @@ fn standard_fixture() -> (AuctionPlan, RoutedAuction, OpenRtbRequest) {
         width: 300,
         height: 250,
     }])
+}
+
+#[test]
+fn openrtb_shared_types_preserves_configured_standard_extensions() {
+    for prebid in [
+        json!(null),
+        json!(false),
+        json!(17),
+        json!("opaque"),
+        json!(["opaque"]),
+        json!({"custom": "opaque"}),
+    ] {
+        let request_ext = json!({"prebid": prebid, "custom": {"enabled": true}});
+        let imp_ext = json!({"prebid": prebid, "custom": [null, "value"]});
+        let request = build(
+            "standard",
+            json!({"request_ext": request_ext, "imp_ext": imp_ext}),
+            None,
+        );
+
+        let wire = serde_json::to_value(&request).expect("should serialize standard request");
+
+        assert_eq!(
+            wire.get("ext"),
+            Some(&request_ext),
+            "should preserve configured request extensions for prebid={prebid}"
+        );
+        let impressions = wire["imp"].as_array().expect("should emit impressions");
+        assert!(!impressions.is_empty(), "should retain a valid impression");
+        for impression in impressions {
+            assert_eq!(
+                impression.get("ext"),
+                Some(&imp_ext),
+                "should preserve configured impression extensions for prebid={prebid}"
+            );
+        }
+    }
+}
+
+#[test]
+fn openrtb_shared_types_preserves_valid_sibling_without_bid_id() {
+    let (_plan, routed, _request) = standard_fixture();
+    for id in [None, Some(json!(null)), Some(json!("")), Some(json!(42))] {
+        let mut valid = json!({
+            "impid": "fictional-slot",
+            "price": 1.5,
+            "adm": "<div>Fictional ad</div>",
+            "w": 300.0,
+            "h": null,
+            "adomain": ["advertiser.example"],
+            "nurl": "https://notifications.example/win",
+            "burl": "https://notifications.example/bill",
+            "adid": "fictional-ad",
+            "crid": "fictional-creative",
+            "ext": {"unknown": {"private": "do-not-forward"}}
+        });
+        if let Some(id) = &id {
+            valid["id"] = id.clone();
+        }
+        let wire = json!({"id": "unrelated-response", "seatbid": [{
+            "seat": "fictional-seat",
+            "bid": [valid, {"id": "malformed", "impid": "fictional-slot", "price": "invalid"}]
+        }]});
+
+        let response =
+            extract_standard_response("fictional-provider", &routed.inputs()[0], &wire, 9);
+
+        assert_eq!(
+            response.status,
+            BidStatus::Success,
+            "should admit valid bid for id={id:?}"
+        );
+        assert_eq!(
+            response.bids.len(),
+            1,
+            "should retain only the valid sibling for id={id:?}"
+        );
+        assert_eq!(
+            response.bids[0].returned_seat.as_deref(),
+            Some("fictional-seat"),
+            "should retain the upstream seat independently of serialization"
+        );
+        assert_eq!(
+            serde_json::to_value(&response.bids[0]).expect("should serialize admitted bid"),
+            json!({
+                "slot_id": "fictional-slot",
+                "price": 1.5,
+                "currency": "USD",
+                "creative": "<div>Fictional ad</div>",
+                "adomain": ["advertiser.example"],
+                "bidder": "fictional-seat",
+                "width": 300,
+                "height": 250,
+                "nurl": "https://notifications.example/win",
+                "burl": "https://notifications.example/bill",
+                "ad_id": "fictional-ad",
+                "creative_id": "fictional-creative",
+                "cache_id": null,
+                "cache_host": null,
+                "cache_path": null,
+                "metadata": {}
+            }),
+            "should preserve the complete admitted projection without inventing an ID or forwarding extensions"
+        );
+        assert_eq!(
+            response.metadata["response_admission"]["rejected_bid_count"], 1,
+            "should account for the malformed sibling"
+        );
+    }
 }
 
 #[test]
@@ -1383,6 +1512,97 @@ fn notification_suppression_matrix_uses_only_exact_valid_returned_seat() {
             .all(|bid| bid.nurl.is_none() && bid.burl.is_none()),
         "suppress_all should remove every notification"
     );
+}
+
+#[test]
+fn openrtb_shared_types_admission_standard_preserves_numeric_siblings() {
+    let (_plan, routed, _request) = standard_fixture();
+    for width in [
+        json!(300.5),
+        json!(0),
+        json!(-1),
+        json!(4294967296_u64),
+        json!("300"),
+    ] {
+        for valid_first in [false, true] {
+            let valid = json!({
+                "id": "fictional-valid",
+                "impid": "fictional-slot",
+                "price": 1.5,
+                "adm": "<div>Fictional ad</div>",
+                "w": 300.0,
+                "h": null,
+                "ext": {"unknown": "do-not-forward"}
+            });
+            let invalid = json!({
+                "id": "fictional-invalid",
+                "impid": "fictional-slot",
+                "price": 99.0,
+                "adm": "<div>Invalid dimensions</div>",
+                "w": width,
+                "h": 250
+            });
+            let bids = if valid_first {
+                vec![valid, invalid]
+            } else {
+                vec![invalid, valid]
+            };
+            let response = extract_standard_response(
+                "fictional-provider",
+                &routed.inputs()[0],
+                &json!({"seatbid": [{"seat": "fictional-seat", "bid": bids}]}),
+                9,
+            );
+
+            assert_eq!(
+                response.status,
+                BidStatus::Success,
+                "should retain a valid sibling for w={width}"
+            );
+            assert_eq!(
+                response.bids.len(),
+                1,
+                "should reject only the invalid dimension for w={width}"
+            );
+            assert_eq!(
+                response.bids[0].returned_seat.as_deref(),
+                Some("fictional-seat"),
+                "should retain the actual seat"
+            );
+            assert_eq!(
+                serde_json::to_value(&response.bids)
+                    .expect("should serialize admitted standard bids"),
+                json!([{
+                    "slot_id": "fictional-slot",
+                    "price": 1.5,
+                    "currency": "USD",
+                    "creative": "<div>Fictional ad</div>",
+                    "adomain": null,
+                    "bidder": "fictional-seat",
+                    "width": 300,
+                    "height": 250,
+                    "nurl": null,
+                    "burl": null,
+                    "bid_id": "fictional-valid",
+                    "ad_id": null,
+                    "creative_id": null,
+                    "cache_id": null,
+                    "cache_host": null,
+                    "cache_path": null,
+                    "metadata": {}
+                }]),
+                "should preserve the complete admitted projection in either sibling order"
+            );
+            assert_eq!(
+                response.metadata["response_admission"],
+                json!({
+                    "rejected_bid_count": 1,
+                    "rejection_reasons": {"invalid_bid": 1}
+                }),
+                "should account for only the invalid sibling"
+            );
+        }
+    }
 }
 
 /// Builds, sends, and parses one request through the real provider and a scripted client.

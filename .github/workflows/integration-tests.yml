@@ -317,6 +317,11 @@ jobs:
         working-directory: crates/trusted-server-integration-tests/browser
         run: node --test trace-fixture.test.cjs
 
+      - name: Test production auction fixture controls
+        run: |
+          node --test crates/trusted-server-integration-tests/fixtures/auctioneer/network.test.mjs
+          node --test crates/trusted-server-integration-tests/browser/helpers/trace-gpt-fixture.test.cjs crates/trusted-server-integration-tests/browser/initial-render/pages.test.cjs
+
       - name: Test initial render ownership
         working-directory: crates/trusted-server-integration-tests/browser
         # Let the runner build its Rubicon + Shared ID artifact; the bidder-only

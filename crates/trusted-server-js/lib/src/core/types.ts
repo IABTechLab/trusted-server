@@ -2,6 +2,8 @@ import type { TraceCollector } from '../trace/collector';
 import type { TraceGptIdentity } from '../trace/types';
 import type { TraceGptBridge } from '../trace/gpt';
 
+import type { PrebidTargetingBridge } from './prebid_targeting';
+
 // Shared TypeScript types for the tsjs core API and extensions.
 export type Size = readonly [number, number];
 
@@ -88,6 +90,8 @@ export interface ApsPrebidRendererEntry {
 
 /** Bid targeting data from the server-side auction, injected into `window.tsjs.bids`. */
 export interface AuctionBidData {
+  /** Finalized targeting from the selected server-side bid. */
+  targeting?: Record<string, string>;
   hb_pb?: string;
   hb_bidder?: string;
   hb_adid?: string;
@@ -443,6 +447,8 @@ export interface FirstImpressionState {
 }
 
 export interface TsjsApi {
+  /** Internal finalized-targeting bridge, installed before external Prebid modules. */
+  prebidTargeting?: PrebidTargetingBridge;
   /** Internal trace observations, installed only for a literal activated document. */
   traceEvidence?: TraceCollector;
   /** Internal active-only bridge shared with the early GPT bootstrap. */
