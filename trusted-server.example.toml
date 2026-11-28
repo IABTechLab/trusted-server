@@ -289,9 +289,9 @@ proxy = "enabled"
 # so the EdgeZero environment override can apply to them.
 [auction]
 # Keep disabled until provider endpoints, routes, and profile values below are
-# replaced with deployment-specific settings. While disabled, POST /auction is
-# turned off and answers a 404.
+# replaced with deployment-specific settings.
 enabled = false
+# While disabled, POST /auction is turned off and answers a 404.
 # Rewrite winning-bid creative asset URLs (images, scripts, styles, media,
 # iframes, CSS url()) to first-party /first-party/proxy endpoints (default
 # true). Set false to leave asset URLs direct. When this or rewrite_clicks is
