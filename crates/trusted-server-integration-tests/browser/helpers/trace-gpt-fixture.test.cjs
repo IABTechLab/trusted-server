@@ -34,3 +34,51 @@ for (const creativeOrigin of [
     dom.window.close()
   })
 }
+
+test('display requests internally while explicit refresh remains wrappable', () => {
+  const dom = new JSDOM('<div id="example-slot"></div>', {
+    url: 'http://localhost:31234/',
+    runScripts: 'outside-only',
+  })
+  const { window } = dom
+  window.eval(source)
+  const gpt = window.googletag
+  const slot = gpt.defineSlot(
+    '/123456789/example-slot',
+    [300, 250],
+    'example-slot'
+  )
+  slot.setTargeting('hb_adid', 'observed-server-ad')
+  const refresh = gpt.pubads().refresh
+  let publicRefreshes = 0
+  gpt.pubads().refresh = (slots) => {
+    publicRefreshes++
+    return refresh(slots)
+  }
+  gpt.display('example-slot')
+  assert.equal(
+    publicRefreshes,
+    0,
+    'display must not call the publisher-facing refresh hook'
+  )
+  assert.equal(window.__traceGptFixture.requests.length, 1)
+  assert.equal(
+    window.__traceGptFixture.requests[0].targeting.hb_adid[0],
+    'observed-server-ad'
+  )
+  gpt.pubads().disableInitialLoad()
+  gpt.display('example-slot')
+  assert.equal(
+    window.__traceGptFixture.requests.length,
+    1,
+    'disabled initial load must suppress display requests'
+  )
+  gpt.pubads().refresh([slot])
+  assert.equal(
+    publicRefreshes,
+    1,
+    'explicit refresh must retain the public hook'
+  )
+  assert.equal(window.__traceGptFixture.requests.length, 2)
+  dom.window.close()
+})

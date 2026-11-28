@@ -100,7 +100,7 @@ errors alone do not pass them. Positive cases require zero violations. Browser
 and bidder TLS rejection cases must also pass.
 
 Results retain worker/browser output, input/image/source identities, actual
-container topology, CLI configuration logs, TLS receipts/fingerprints, NSS and
+container topology, accepted configuration snapshots/digests, CLI logs, TLS receipts/fingerprints, NSS and
 executable hashes, response digests, public/GPT targeting and creative
 observations. On failure the coordinator retains diagnostics and removes only
 its owned container/network. Do not count a missing or failing production run

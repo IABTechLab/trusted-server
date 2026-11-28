@@ -12,6 +12,19 @@
       listener({ slot, ...facts })
   }
 
+  function requestSlots(selected) {
+    for (const slot of selected) {
+      if (slots.get(slot.getSlotElementId()) !== slot) continue
+      requests.push({
+        slot,
+        targeting: Object.fromEntries(
+          slot.getTargetingKeys().map((key) => [key, slot.getTargeting(key)])
+        ),
+      })
+      emit('slotRequested', slot)
+    }
+  }
+
   const service = {
     getSlots: () => [...slots.values()],
     getTargeting: () => [],
@@ -41,16 +54,7 @@
       return service
     },
     refresh(selected = [...slots.values()]) {
-      for (const slot of selected) {
-        if (slots.get(slot.getSlotElementId()) !== slot) continue
-        requests.push({
-          slot,
-          targeting: Object.fromEntries(
-            slot.getTargetingKeys().map((key) => [key, slot.getTargeting(key)])
-          ),
-        })
-        emit('slotRequested', slot)
-      }
+      requestSlots(selected)
     },
   }
 
@@ -113,7 +117,7 @@
           ? target
           : target.getSlotElementId?.() || target.id
       const slot = slots.get(id)
-      if (slot && !initialLoadDisabled) service.refresh([slot])
+      if (slot && !initialLoadDisabled) requestSlots([slot])
     },
     getConfig: () => ({ disableInitialLoad: initialLoadDisabled }),
     setConfig(config) {

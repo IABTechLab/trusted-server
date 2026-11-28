@@ -1,6 +1,6 @@
 import { test, expect, type Page } from '@playwright/test'
 import { createHash } from 'node:crypto'
-import { readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, readFileSync, writeFileSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { guardAuctionNetwork } from '../../helpers/auction-network'
 
@@ -68,14 +68,48 @@ test.beforeAll(async ({ browser }) => {
 })
 test.afterAll(() => {
   if (process.env.AUCTIONEER_EVIDENCE_MANIFEST)
-    writeFileSync(
-      '/results/browser-observations.json',
-      JSON.stringify(evidence, null, 2)
+    appendFileSync(
+      '/results/browser-observations.jsonl',
+      JSON.stringify(evidence) + '\n'
     )
 })
 
+test.afterEach(async ({ page }, info) => {
+  if (info.status === info.expectedStatus) return
+  let state: unknown
+  try {
+    state = await page.evaluate(() => {
+      const api = Reflect.get(window, 'tsjs')
+      const gpt = Reflect.get(window, 'googletag')
+      return {
+        readyState: document.readyState,
+        visibility: document.visibilityState,
+        generation: api?.navGeneration,
+        initialScheduled: api?.initialAdInitScheduled,
+        slots: api?.adSlots,
+        bidIds: Object.keys(api?.bids ?? {}),
+        gptSlots: gpt
+          ?.pubads()
+          .getSlots()
+          .map((slot: { getSlotElementId(): string }) =>
+            slot.getSlotElementId()
+          ),
+        requests: Reflect.get(window, '__traceGptFixture')?.requests.map(
+          (request: { targeting: unknown }) => request.targeting
+        ),
+      }
+    })
+  } catch (error) {
+    state = { captureError: String(error) }
+  }
+  await info.attach('runtime-state', {
+    body: Buffer.from(JSON.stringify(state, null, 2)),
+    contentType: 'application/json',
+  })
+})
+
 for (const mode of ['direct', 'publisher', 'empty'] as const) {
-  test(`production PBS ${mode} delivers real targeting and creative`, async ({
+  test(`production PBS ${mode} observes actual auction delivery`, async ({
     page,
     context,
   }) => {

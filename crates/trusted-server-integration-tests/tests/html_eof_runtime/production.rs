@@ -129,7 +129,17 @@ impl Worker {
                 )])),
             );
         fs::write("/work/fastly.toml", config::serialize(&manifest)?)
-            .change_context(HarnessError::Io)
+            .change_context(HarnessError::Io)?;
+        let config_snapshot = Path::new("/results").join(format!("config-{bidder_port}.toml"));
+        let manifest_snapshot = Path::new("/results").join(format!("fastly-{bidder_port}.toml"));
+        fs::copy("/work/trusted-server.toml", &config_snapshot).change_context(HarnessError::Io)?;
+        fs::copy("/work/fastly.toml", &manifest_snapshot).change_context(HarnessError::Io)?;
+        self.run(
+            self.command("sha256sum")
+                .arg(config_snapshot)
+                .arg(manifest_snapshot),
+            &format!("config-digests-{bidder_port}"),
+        )
     }
 
     fn viceroy(&self, name: &str) -> HarnessResult<ManagedChild> {
@@ -537,7 +547,20 @@ pub(super) fn run() -> HarnessResult<()> {
             )));
         }
     }
-    fs::write("/results/worker.json", json!({"mode":"production-pbs-baseline","auctioneerAcceptance":false,"tlsNegativeCases":["wrong-san","untrusted-ca"],"listeners":listeners,"prebid":serde_json::from_slice::<Value>(&fs::read("/inputs/prebid/manifest.json").change_context(HarnessError::Io)?).change_context(HarnessError::Configuration)?}).to_string()).change_context(HarnessError::Io)?;
+    let bundle_metadata: Value = serde_json::from_slice(
+        &fs::read("/inputs/prebid/manifest.json").change_context(HarnessError::Io)?,
+    )
+    .change_context(HarnessError::Configuration)?;
+    let config_snapshots = [18443,18444,18445].map(|port| json!({"config":format!("config-{port}.toml"),"runtime":format!("fastly-{port}.toml"),"digests":format!("config-digests-{port}.log")}));
+    let outcome = json!({
+        "mode": "production-pbs-baseline",
+        "auctioneerAcceptance": false,
+        "tlsNegativeCases": ["wrong-san", "untrusted-ca"],
+        "configSnapshots": config_snapshots,
+        "listeners": listeners,
+        "prebid": bundle_metadata,
+    });
+    fs::write("/results/worker.json", outcome.to_string()).change_context(HarnessError::Io)?;
     worker.run(
         worker.command("sha256sum").args([
             GUEST,
