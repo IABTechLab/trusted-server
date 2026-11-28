@@ -399,7 +399,6 @@ async fn discovery_route_body_is_json_parity() {
     // return an error body. Assert that whichever body type each returns (JSON or
     // not) is consistent: if the Cloudflare adapter returns valid JSON then the
     // Axum adapter must also return valid JSON for the same route.
-    use http_body_util::BodyExt as _;
     use serde_json::Value;
 
     let (axum_status, axum_body_bytes) = {

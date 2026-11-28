@@ -631,9 +631,10 @@ rate limiter. Rebuild validates the old signature before minting its
 replacement and never permits `tsurl`, `tstoken`, or `tsexp` mutation.
 Validation and re-signing depend on `publisher.proxy_secret`.
 
-While click wrapping is off, JSON and form POSTs return `404` with
-`Cache-Control: no-store, private` before any body or token check. The switch
-is the same as for [`/first-party/click`](#get-first-party-click). See
+While click wrapping is off, any `POST` returns `404` with
+`Cache-Control: no-store, private` before its content type, body or token is
+checked. The switch is the same as for
+[`/first-party/click`](#get-first-party-click). See
 [Route availability](#route-availability).
 
 **Request Body:**

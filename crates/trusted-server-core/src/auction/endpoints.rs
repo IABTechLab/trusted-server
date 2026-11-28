@@ -1494,7 +1494,7 @@ mod tests {
             request,
         )
         .await
-        .expect("consent-denied auction should return a no-bid response");
+        .expect("should return a no-bid response when consent is denied");
 
         assert_eq!(
             response.status(),

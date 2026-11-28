@@ -696,6 +696,9 @@ fastly log-tail
 
 ### Test Endpoints Locally
 
+The auction call below needs `[auction].enabled = true`. Otherwise
+`POST /auction` is turned off and answers `404`.
+
 ```bash
 # Start local server
 fastly compute serve
@@ -754,15 +757,15 @@ If you encounter an error not listed here:
 
 ## Common HTTP Status Codes
 
-| Code    | Meaning         | Common Causes                    | Quick Fix            |
-| ------- | --------------- | -------------------------------- | -------------------- |
-| **400** | Bad Request     | Missing parameters, invalid JSON | Check request format |
-| **401** | Unauthorized    | Missing/invalid auth             | Check credentials    |
-| **403** | Forbidden       | Invalid token, disabled feature  | Verify token/config  |
-| **404** | Not Found       | Unknown endpoint                 | Check URL path       |
-| **500** | Internal Error  | Configuration error, bug         | Check logs           |
-| **502** | Bad Gateway     | Backend unavailable              | Verify backend       |
-| **504** | Gateway Timeout | Backend slow                     | Increase timeout     |
+| Code    | Meaning         | Common Causes                                                                          | Quick Fix                                                                       |
+| ------- | --------------- | -------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------- |
+| **400** | Bad Request     | Missing parameters, invalid JSON                                                       | Check request format                                                            |
+| **401** | Unauthorized    | Missing/invalid auth                                                                   | Check credentials                                                               |
+| **403** | Forbidden       | Invalid token, disabled feature                                                        | Verify token/config                                                             |
+| **404** | Not Found       | Unknown endpoint, or the endpoint's switch is off (body `This endpoint is turned off`) | Check URL path; see [Route availability](./api-reference.md#route-availability) |
+| **500** | Internal Error  | Configuration error, bug                                                               | Check logs                                                                      |
+| **502** | Bad Gateway     | Backend unavailable                                                                    | Verify backend                                                                  |
+| **504** | Gateway Timeout | Backend slow                                                                           | Increase timeout                                                                |
 
 ---
 

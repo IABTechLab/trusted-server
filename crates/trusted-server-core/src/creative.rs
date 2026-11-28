@@ -1589,8 +1589,8 @@ fn rewrite_creative_html_impl(
     rewritten
 }
 
-/// Stream processor for HTML fetched by a non-streaming proxy request, such as
-/// `/first-party/proxy`, that rewrites asset and click-through URLs to
+/// Buffering processor for HTML that a proxy request without streaming fetches,
+/// such as `/first-party/proxy`, that rewrites asset and click-through URLs to
 /// first-party endpoints.
 ///
 /// This processor buffers input chunks and processes the complete HTML document

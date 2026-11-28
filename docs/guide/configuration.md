@@ -2364,7 +2364,8 @@ Creatives already on a page keep their rewritten URLs. Once `rewrite_creatives`
 is turned off, they stop loading proxied assets. Once click wrapping is turned
 off, their links land on the `404` instead of the advertiser. Pages cached
 before `enabled` was turned off still call `POST /auction` and get the `404`
-until they expire.
+until they expire. Publisher code that calls `tsjs.requestAds` keeps calling
+`POST /auction` from fresh pages too, and gets the same `404`.
 :::
 
 ::: warning Existing configs, upgrade sequencing, and rollback

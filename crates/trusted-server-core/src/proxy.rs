@@ -3450,11 +3450,17 @@ mod tests {
 
     #[test]
     fn creative_endpoints_follow_their_switches() {
+        assert!(
+            !create_test_settings().auction.enabled,
+            "should build every case with the auction off, so the creative gates cannot depend on the auction switch"
+        );
         // (rewrite_creatives, rewrite_clicks, proxy and sign answer, click and rebuild answer)
         let cases = [
             (false, None, false, false),
             (false, Some(true), false, true),
+            (false, Some(false), false, false),
             (true, Some(false), true, false),
+            (true, Some(true), true, true),
             (true, None, true, true),
         ];
 
