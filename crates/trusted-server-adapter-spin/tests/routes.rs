@@ -22,7 +22,13 @@ use trusted_server_core::settings::Settings;
 /// `Settings::ADMIN_ENDPOINTS` and the default config, so the canonical
 /// `/_ts/admin/keys/*` routes are auth-gated exactly as in production.
 fn test_router() -> RouterService {
-    let settings = Settings::from_toml(
+    TrustedServerApp::routes_with_settings(test_settings())
+        .expect("should build router from test settings")
+}
+
+/// Shared route test settings behind [`test_router`].
+fn test_settings() -> Settings {
+    Settings::from_toml(
         r#"
             [[handlers]]
             path = "^/_ts/admin"
@@ -42,10 +48,7 @@ fn test_router() -> RouterService {
             enabled = true
         "#,
     )
-    .expect("should parse route test settings");
-
-    TrustedServerApp::routes_with_settings(settings)
-        .expect("should build router from test settings")
+    .expect("should parse route test settings")
 }
 
 async fn route(router: RouterService, req: Request) -> Response {
@@ -738,31 +741,12 @@ const TURNED_OFF_REQUESTS: &[(&str, &str)] = &[
     ("POST", "/auction"),
 ];
 
-/// Build a router from the route test settings with the auction and creative
+/// Build a router from [`test_settings`] with the auction and creative
 /// rewriting off.
 fn turned_off_router() -> RouterService {
-    let settings = Settings::from_toml(
-        r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.example.com"
-            cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
-            proxy_secret = "route-test-proxy-secret"
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [auction]
-            enabled = false
-            rewrite_creatives = false
-        "#,
-    )
-    .expect("should parse turned-off route test settings");
+    let mut settings = test_settings();
+    settings.auction.enabled = false;
+    settings.auction.rewrite_creatives = false;
 
     TrustedServerApp::routes_with_settings(settings)
         .expect("should build router with the endpoints turned off")

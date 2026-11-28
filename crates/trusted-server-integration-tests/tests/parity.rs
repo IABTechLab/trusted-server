@@ -65,28 +65,10 @@ fn test_settings() -> Settings {
 
 /// Shared test settings with the auction and creative rewriting off.
 fn turned_off_settings() -> Settings {
-    Settings::from_toml(
-        r#"
-            [[handlers]]
-            path = "^/_ts/admin"
-            username = "admin"
-            password = "admin-pass"
-
-            [publisher]
-            domain = "test-publisher.example.com"
-            cookie_domain = ".test-publisher.example.com"
-            origin_url = "https://origin.test-publisher.example.com"
-            proxy_secret = "parity-test-proxy-secret"
-
-            [ec]
-            passphrase = "test-secret-key-32-bytes-minimum"
-
-            [auction]
-            enabled = false
-            rewrite_creatives = false
-        "#,
-    )
-    .expect("should parse turned-off parity test settings")
+    let mut settings = test_settings();
+    settings.auction.enabled = false;
+    settings.auction.rewrite_creatives = false;
+    settings
 }
 
 /// Build the Axum adapter router from the shared test settings.
