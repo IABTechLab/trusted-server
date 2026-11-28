@@ -43,6 +43,7 @@ type Frame = {
   closed: boolean;
   consumed: boolean;
   receipts: Map<Slot, Set<string>>;
+  bids: Map<string, NativeBid[]>;
 };
 type DeliveryOwner = { key: string; values: string[] };
 type AppliedKey = {
@@ -254,6 +255,9 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
           record.generation !== (api.navGeneration ?? 0) ||
           !identityAvailable() ||
           bid.sendStandardTargeting === false ||
+          bid.adapterCode !== 'trustedServer' ||
+          bid.bidderCode !== record.bidderCode ||
+          bid.adUnitCode !== record.adUnitCode ||
           bid.adId !== record.adId ||
           bid.adserverTargeting?.hb_adid !== record.adId
         )
@@ -295,11 +299,12 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
       }
       function owner(
         unit: string,
-        targeting: Targeting
+        targeting: Targeting,
+        candidates?: NativeBid[]
       ): { bid: NativeBid; record: BoundTargeting } | undefined {
         const id = targeting.hb_adid;
         if (typeof id !== 'string') return;
-        const matches = cachedBids(unit).bids.filter(
+        const matches = (candidates ?? cachedBids(unit).bids).filter(
           (bid) => bid.adId === id || records.get(bid)?.adId === id
         );
         if (matches.length !== 1) return;
@@ -386,6 +391,7 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
       function close(frame: Frame): void {
         frame.closed = true;
         frame.receipts.clear();
+        frame.bids.clear();
         if (active === frame) {
           active = frame.previous;
           while (active?.closed) active = active.previous;
@@ -487,7 +493,7 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
         for (const [unit, incoming] of Object.entries(event)) {
           if (!isRecord(incoming)) continue;
           const targeting = incoming as Targeting;
-          const owned = owner(unit, targeting);
+          const owned = owner(unit, targeting, frame.bids.get(unit));
           const rejected = owned !== undefined && !compatible(owned.bid, owned.record);
           const record = rejected ? undefined : owned?.record;
           const retained = rejected ? withoutOwnedTargeting(targeting, owned.record) : targeting;
@@ -513,6 +519,7 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
           event[unit] = rejected ? retained : project(unit, targeting);
         }
         frame.receipts.clear();
+        frame.bids.clear();
       });
 
       prebid.getAdserverTargeting = function (...args) {
@@ -546,9 +553,33 @@ export function createPrebidTargetingBridge(api: TsjsApi): PrebidTargetingBridge
           closed: false,
           consumed: false,
           receipts: new Map(),
+          bids: new Map(),
         };
+        const requested = Array.isArray(args[0]) ? args[0] : [args[0]];
+        const codes = new Set([
+          ...units,
+          ...requested.filter((code): code is string => typeof code === 'string'),
+        ]);
+        function capture(): void {
+          for (const code of codes) {
+            const bids = new Set<NativeBid>(frame.bids.get(code));
+            for (const bid of cachedBids(code).bids) bids.add(bid);
+            frame.bids.set(code, [...bids]);
+          }
+        }
+        // Native selects before publisher slot matching. Keep its possible
+        // owners reachable even when matching moves a bid to another unit.
+        // Resolve only the emitted render ID; the snapshot never selects bids.
+        capture();
+        let firstMatching = true;
         const matching = args[1];
         args[1] = function (this: unknown, slot: Slot) {
+          // A native targeting hook can defer its continuation past our return.
+          // Refresh once before publisher callbacks to include newly completed bids.
+          if (firstMatching) {
+            firstMatching = false;
+            capture();
+          }
           activate(frame);
           let custom: unknown;
           active = undefined;

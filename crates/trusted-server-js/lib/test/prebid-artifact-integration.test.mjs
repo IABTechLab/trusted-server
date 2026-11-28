@@ -1019,6 +1019,120 @@ describe('pinned Prebid public targeting contract', () => {
     }
   });
 
+  it.each(['bidderCode', 'adUnitCode', 'adapterCode'])(
+    'refuses finalized targeting after a publisher changes the bound %s', async (field) => {
+      let local;
+      const moved = 'example-moved-slot';
+      const page = targetingPage({
+        config: { useBidCache: true }, client: { cpm: 0.99 }, clientCode: 'exampleClient',
+        respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+        beforeShim: (win) => win.pbjs.onEvent('bidResponse', (bid) => {
+          if (bid.adapterCode !== 'trustedServer') return;
+          local = bid; bid[field] = field === 'adUnitCode' ? moved : 'exampleChangedIdentity';
+        }),
+      });
+      try {
+        await page.auction();
+        const prebid = page.pageWindow.pbjs;
+        const maps = prebid.getAdserverTargeting([code, moved]);
+        expect(maps[code]).toMatchObject({ hb_pb: '0.90' });
+        expect(maps[code]).not.toHaveProperty('example_engine');
+        expect(maps[moved]).not.toHaveProperty('example_engine');
+        expect(local.cpm).toBeLessThan(0);
+        expect(local.adserverTargeting).toEqual({});
+        expect(prebid.getAdserverTargetingForAdUnitCode(code)).toMatchObject({ hb_pb: '0.90' });
+        expect(new URLSearchParams(prebid.getAdserverTargetingForAdUnitCodeStr(code)).get('hb_pb')).toBe('0.90');
+        const client = page.bids().find((bid) => bid.bidderCode === 'exampleClient');
+        await page.target();
+        expect(page.slots[0].values.hb_adid).toEqual([client.adId]);
+        expect(page.slots[0].values.hb_pb).toEqual(['0.90']);
+        expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      } finally { page.close(); }
+    }
+  );
+
+  it.each(['bidderCode', 'adUnitCode', 'adapterCode'])(
+    'leaves a mapless server bid under native control after a publisher changes %s', async (field) => {
+      let local;
+      const moved = 'example-moved-slot';
+      const page = targetingPage({
+        config: { useBidCache: true }, respond: () => serverResponse(price),
+        beforeShim: (win) => win.pbjs.onEvent('bidResponse', (bid) => {
+          if (bid.adapterCode !== 'trustedServer') return;
+          local = bid; bid[field] = field === 'adUnitCode' ? moved : 'exampleChangedIdentity';
+        }),
+      });
+      try {
+        await page.auction();
+        const selectedCode = field === 'adUnitCode' ? moved : code;
+        expect(local.cpm).toBe(price);
+        expect(page.pageWindow.pbjs.getAdserverTargetingForAdUnitCode(selectedCode)).toMatchObject({ hb_pb: '1.20', hb_adid: local.adId });
+        const count = page.targeted.length;
+        page.pageWindow.pbjs.setTargetingForGPTAsync([selectedCode], () => (unit) => unit === selectedCode);
+        await vi.waitFor(() => expect(page.targeted.length).toBe(count + 1));
+        expect(page.slots[0].values.hb_adid).toEqual([local.adId]);
+        expect(page.slots[0].values.hb_pb).toEqual(['1.20']);
+      } finally { page.close(); }
+    }
+  );
+
+  it.each(['bidderCode', 'adUnitCode', 'adapterCode'])(
+    'leaves a native client winner unchanged after a publisher changes %s', async (field) => {
+      let client;
+      const moved = 'example-moved-slot';
+      const page = targetingPage({
+        config: { useBidCache: true }, client: { cpm: 3.39 }, clientCode: 'exampleClient',
+        respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+        beforeShim: (win) => win.pbjs.onEvent('bidResponse', (bid) => {
+          if (bid.adapterCode !== 'exampleClient') return;
+          client = bid; bid[field] = field === 'adUnitCode' ? moved : 'exampleChangedIdentity';
+        }),
+      });
+      try {
+        await page.auction();
+        const selectedCode = field === 'adUnitCode' ? moved : code;
+        expect(client.cpm).toBe(3.39);
+        const prebid = page.pageWindow.pbjs;
+        expect(prebid.getAdserverTargetingForAdUnitCode(selectedCode)).toMatchObject({ hb_pb: '3.30', hb_adid: client.adId });
+        expect(prebid.getAdserverTargetingForAdUnitCode(selectedCode)).not.toHaveProperty('example_engine');
+        const count = page.targeted.length;
+        prebid.setTargetingForGPTAsync([selectedCode], () => (unit) => unit === selectedCode);
+        await vi.waitFor(() => expect(page.targeted.length).toBe(count + 1));
+        expect(page.slots[0].values.hb_adid).toEqual([client.adId]);
+        expect(page.slots[0].values.hb_pb).toEqual(['3.30']);
+        expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      } finally { page.close(); }
+    }
+  );
+
+  it.each(['builder', 'predicate'].flatMap((phase) =>
+    ['bidderCode', 'adUnitCode', 'adapterCode'].map((field) => [phase, field])
+  ))('refuses native fallback when the matching %s changes %s', async (phase, field) => {
+    const page = targetingPage({
+      client: { cpm: 0.99 }, clientCode: 'exampleClient',
+      respond: () => serverResponse(price, { hb_pb: '8.88', example_engine: 'selected' }),
+    });
+    try {
+      await page.auction();
+      const local = page.bids().find((bid) => bid.adapterCode === 'trustedServer');
+      const client = page.bids().find((bid) => bid.bidderCode === 'exampleClient');
+      const change = () => { local[field] = field === 'adUnitCode' ? 'example-moved-slot' : 'exampleChangedIdentity'; };
+      await page.target(() => {
+        if (phase === 'builder') change();
+        return () => { if (phase === 'predicate') change(); return true; };
+      });
+      expect(page.slots[0].values).not.toHaveProperty('hb_adid');
+      expect(page.slots[0].values).not.toHaveProperty('hb_pb');
+      expect(page.slots[0].values).not.toHaveProperty('example_engine');
+      expect(page.targeted[0][code]).not.toHaveProperty('hb_pb');
+      expect(local.cpm).toBeLessThan(0);
+      const values = Object.values(page.slots[0].values).flat();
+      expect(values).not.toContain(local.adId); expect(values).not.toContain('1.20');
+      expect(values).toContain(client.adId); expect(values).toContain('0.90');
+      expect(page.slots[0].values.section).toEqual(['example-section']);
+    } finally { page.close(); }
+  });
+
   it('refuses a targeting-dependent bid if early core installation is unavailable', async () => {
     const page = targetingPage({
       core: false,
