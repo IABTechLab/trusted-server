@@ -170,6 +170,7 @@ interface InjectedPrebidTestConfig {
   accountId?: string;
   timeout?: number;
   debug?: boolean;
+  auctionEnabled?: boolean;
   serverSideBidders?: string[];
   clientSideBidders?: string[];
   excludedGamAdUnitPathSuffixes?: unknown;
@@ -2424,6 +2425,38 @@ describe('prebid/installPrebidNpm', () => {
       expect(payload.eids).toBeUndefined();
     });
 
+    function bidRequestsFor(bidder: string): Array<Record<string, unknown>> {
+      return [
+        {
+          adUnitCode: 'div-gpt-1',
+          bidder,
+          mediaTypes: { banner: { sizes: [[300, 250]] } },
+          params: {},
+        },
+      ];
+    }
+
+    it('buildRequests builds no request while the auction is off', () => {
+      testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+      const spec = getAdapterSpec();
+
+      // A publisher alias of trustedServer runs this same spec under its own code.
+      expect(spec.buildRequests(bidRequestsFor('trustedServer'))).toEqual([]);
+      expect(spec.buildRequests(bidRequestsFor('exampleAlias'))).toEqual([]);
+      expect(mockGetUserIdsAsEids).not.toHaveBeenCalled();
+    });
+
+    it('buildRequests still posts to /auction when auctionEnabled is absent', () => {
+      testWindow.__tsjs_prebid = { serverSideBidders: [] };
+      const spec = getAdapterSpec();
+
+      const result = spec.buildRequests(bidRequestsFor('exampleAlias'));
+
+      expect(Array.isArray(result)).toBe(false);
+      expect(result.method).toBe('POST');
+      expect(result.url).toMatch(/\/auction$/);
+    });
+
     it('buildRequests includes current Prebid EIDs in the /auction payload', () => {
       const spec = getAdapterSpec();
       mockGetUserIdsAsEids.mockReturnValue([
@@ -2780,6 +2813,120 @@ describe('prebid/installPrebidNpm', () => {
 
       selected.remove();
       unselected.remove();
+    });
+
+    it('adds no trustedServer bid when the auction is off', () => {
+      testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'div-auction-off',
+        bids: [{ bidder: 'exampleBidder', params: { placementId: 1 } }],
+      };
+
+      pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+
+      expect(unit.bids).toEqual([{ bidder: 'exampleBidder', params: { placementId: 1 } }]);
+      expect(mockRequestBids).toHaveBeenCalled();
+    });
+
+    it('drops a publisher-configured trustedServer bid when the auction is off', () => {
+      testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'div-auction-off',
+        bids: [
+          { bidder: 'trustedServer', params: {} },
+          { bidder: 'exampleBidder', params: {} },
+        ],
+      };
+
+      pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+
+      expect(unit.bids).toEqual([{ bidder: 'exampleBidder', params: {} }]);
+    });
+
+    it('leaves an empty bid list when the only bid was trustedServer and the auction is off', () => {
+      testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'div-auction-off',
+        bids: [{ bidder: 'trustedServer', params: {} }],
+      };
+
+      expect(() =>
+        pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg)
+      ).not.toThrow();
+
+      expect(unit.bids).toEqual([]);
+      expect(mockRequestBids).toHaveBeenCalled();
+    });
+
+    it.each([
+      { serverSideBidders: ['appnexus'] },
+      { auctionEnabled: true, serverSideBidders: ['appnexus'] },
+    ])('keeps adding the trustedServer bid when auctionEnabled is absent or true: %j', (config) => {
+      testWindow.__tsjs_prebid = config;
+      const pbjs = installPrebidNpm();
+      const unit = {
+        code: 'div-auction-on',
+        bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+      };
+
+      pbjs.requestBids({ adUnits: [unit] } as unknown as RequestBidsArg);
+
+      expect(unit.bids.map((bid) => bid.bidder)).toEqual(['trustedServer']);
+    });
+
+    describe('treats an empty adUnitCodes list as every global ad unit', () => {
+      it('with the auction on', () => {
+        testWindow.__tsjs_prebid = { serverSideBidders: ['appnexus'] };
+        const globalUnit: TestAdUnit = {
+          code: 'div-global',
+          bids: [{ bidder: 'appnexus', params: { placementId: 1 } }],
+        };
+        mockPbjs.adUnits = [globalUnit];
+        const pbjs = installPrebidNpm();
+
+        pbjs.requestBids({ adUnitCodes: [] } as unknown as RequestBidsArg);
+
+        expect(globalUnit.bids?.map((bid) => bid.bidder)).toEqual(['trustedServer']);
+      });
+
+      it('with the auction off', () => {
+        testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+        const globalUnit: TestAdUnit = {
+          code: 'div-global',
+          bids: [
+            { bidder: 'trustedServer', params: {} },
+            { bidder: 'exampleBidder', params: {} },
+          ],
+        };
+        mockPbjs.adUnits = [globalUnit];
+        const pbjs = installPrebidNpm();
+
+        pbjs.requestBids({ adUnitCodes: [] } as unknown as RequestBidsArg);
+
+        expect(globalUnit.bids).toEqual([{ bidder: 'exampleBidder', params: {} }]);
+      });
+    });
+
+    it('drops the trustedServer bid from adUnitCodes-selected global units when the auction is off', () => {
+      testWindow.__tsjs_prebid = { auctionEnabled: false, serverSideBidders: [] };
+      const selectedUnit: TestAdUnit = {
+        code: 'div-selected',
+        bids: [{ bidder: 'trustedServer', params: {} }],
+      };
+      const otherUnit: TestAdUnit = {
+        code: 'div-other',
+        bids: [{ bidder: 'trustedServer', params: {} }],
+      };
+      mockPbjs.adUnits = [selectedUnit, otherUnit];
+      const pbjs = installPrebidNpm();
+
+      pbjs.requestBids({ adUnitCodes: ['div-selected'] } as unknown as RequestBidsArg);
+
+      expect(selectedUnit.bids).toEqual([]);
+      expect(otherUnit.bids).toEqual([{ bidder: 'trustedServer', params: {} }]);
     });
 
     it('preserves publisher ts adserverTargeting while adding trustedServer settings', () => {
@@ -3668,6 +3815,89 @@ describe('prebid/installRefreshHandler', () => {
     );
 
     delete testWindow.__tsjs_prebid;
+    mockPbjs.adUnits = [];
+  });
+
+  /**
+   * Runs one GPT refresh with the auction off and returns the ad units that
+   * reached Prebid. The shim is installed so refresh units pass through it.
+   */
+  function refreshWithAuctionOff(originalBids: TestBid[]): TestAdUnit[] {
+    testWindow.__tsjs_prebid = {
+      auctionEnabled: false,
+      serverSideBidders: [],
+      clientSideBidders: ['rubicon'],
+    };
+    mockPbjs.adUnits = [{ code: 'div-ad-homepage-header', bids: originalBids }];
+    const gptSlot = {
+      getSlotElementId: vi.fn(() => 'div-ad-homepage-header'),
+      getTargeting: vi.fn(() => []),
+    };
+    const pubads = {
+      refresh: vi.fn(),
+      getSlots: vi.fn(() => [gptSlot]),
+    };
+    testWindow.googletag = {
+      cmd: { push: (fn: () => void) => fn() },
+      pubads: () => pubads,
+    };
+    testWindow.tsjs = {
+      adSlots: [
+        {
+          id: 'homepage_header_ad',
+          gam_unit_path: '/123/homepage',
+          div_id: 'div-ad-homepage-header',
+          formats: [[728, 90]],
+          targeting: { zone: 'homepage' },
+        },
+      ],
+    };
+
+    installPrebidNpm();
+    installRefreshHandler(750);
+    pubads.refresh();
+
+    expect(mockRequestBids).toHaveBeenCalledTimes(1);
+    return (mockRequestBids.mock.calls[0][0] as { adUnits: TestAdUnit[] }).adUnits;
+  }
+
+  it('refresh auctions with the auction off request no trustedServer bid', () => {
+    const refreshAdUnits = refreshWithAuctionOff([
+      { bidder: 'trustedServer', params: {} },
+      { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+    ]);
+
+    expect(refreshAdUnits).toEqual([
+      expect.objectContaining({
+        code: 'div-ad-homepage-header',
+        bids: [{ bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } }],
+      }),
+    ]);
+
+    mockPbjs.adUnits = [];
+  });
+
+  it('refresh auctions with the auction off keep an alias bid as browser demand but build no request for it', () => {
+    const refreshAdUnits = refreshWithAuctionOff([
+      { bidder: 'trustedServer', params: {} },
+      { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+      { bidder: 'exampleAlias', params: {} },
+    ]);
+
+    expect(refreshAdUnits).toEqual([
+      expect.objectContaining({
+        code: 'div-ad-homepage-header',
+        bids: [
+          { bidder: 'rubicon', params: { accountId: 1, siteId: 2, zoneId: 3 } },
+          { bidder: 'exampleAlias', params: {} },
+        ],
+      }),
+    ]);
+
+    const spec = mockRegisterBidAdapter.mock.calls[0][2] as TestAdapterSpec;
+    const aliasBid = refreshAdUnits[0].bids?.find((bid) => bid.bidder === 'exampleAlias');
+    expect(spec.buildRequests([{ adUnitCode: 'div-ad-homepage-header', ...aliasBid }])).toEqual([]);
+
     mockPbjs.adUnits = [];
   });
 
